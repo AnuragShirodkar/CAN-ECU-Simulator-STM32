@@ -3,6 +3,9 @@
 	<item key="hasShownOverlayPopupBefore" value="true"/>
 	<item key="replaceBarOpen" value="false"/>
 	<list key="searchhistory">
+		<item value="Task_CANTransmit"/>
+		<item value="Task_FaultDetect"/>
+		<item value="g_flameSeen"/>
 		<item value="osKernelInitialize();"/>
 		<item value="adcRaw"/>
 		<item value="g_adcRaw"/>
@@ -14,7 +17,6 @@
 		<item value="char logBuf[80]; "/>
 		<item value="ssnprintf"/>
 		<item value="ssnprintf(logBuf, sizeof(logBuf),&#x0A;"/>
-		<item value="Task_CANTransmit"/>
 		<item value="ST7735_WriteChar"/>
 	</list>
 	<section name="org.eclipse.ui.texteditor.FindReplaceDialog">

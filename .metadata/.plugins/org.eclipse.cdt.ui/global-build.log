@@ -1,4 +1,4 @@
-01:33:53 **** Incremental Build of configuration Debug for project Engine_ECU ****
+01:50:09 **** Incremental Build of configuration Debug for project Engine_ECU ****
 make -j8 all 
 arm-none-eabi-gcc "../Core/Src/main.c" -mcpu=cortex-m4 -std=gnu11 -g3 -DDEBUG -DUSE_HAL_DRIVER -DSTM32F407xx -c -I../Core/Inc -I../Drivers/STM32F4xx_HAL_Driver/Inc -I../Drivers/STM32F4xx_HAL_Driver/Inc/Legacy -I../Drivers/CMSIS/Device/ST/STM32F4xx/Include -I../Drivers/CMSIS/Include -I../Middlewares/Third_Party/FreeRTOS/Source/include -I../Middlewares/Third_Party/FreeRTOS/Source/CMSIS_RTOS_V2 -I../Middlewares/Third_Party/FreeRTOS/Source/portable/GCC/ARM_CM4F -O0 -ffunction-sections -fdata-sections -Wall -fstack-usage -fcyclomatic-complexity -MMD -MP -MF"Core/Src/main.d" -MT"Core/Src/main.o" --specs=nano.specs -mfpu=fpv4-sp-d16 -mfloat-abi=hard -mthumb -o "Core/Src/main.o"
 arm-none-eabi-gcc -o "Engine_ECU.elf" @"objects.list"   -mcpu=cortex-m4 -T"C:\Users\ADMIN\STM32CubeIDE\workspace_ECU\Engine_ECU\STM32F407VGTX_FLASH.ld" --specs=nosys.specs -Wl,-Map="Engine_ECU.map" -Wl,--gc-sections -static -u _printf_float --specs=nano.specs -mfpu=fpv4-sp-d16 -mfloat-abi=hard -mthumb -Wl,--start-group -lc -lm -Wl,--end-group
@@ -7,15 +7,15 @@ Finished building target: Engine_ECU.elf
 arm-none-eabi-size  Engine_ECU.elf 
 arm-none-eabi-objdump -h -S Engine_ECU.elf  > "Engine_ECU.list"
    text	   data	    bss	    dec	    hex	filename
-  47096	    496	  21024	  68616	  10c08	Engine_ECU.elf
+  45152	    496	  21024	  66672	  10470	Engine_ECU.elf
 Finished building: default.size.stdout
  
 Finished building: Engine_ECU.list
  
-01:34:04 **** Incremental Build of configuration Debug for project Engine_ECU ****
+01:50:15 **** Incremental Build of configuration Debug for project Engine_ECU ****
 make -j8 all 
 arm-none-eabi-size  Engine_ECU.elf 
    text	   data	    bss	    dec	    hex	filename
-  47096	    496	  21024	  68616	  10c08	Engine_ECU.elf
+  45152	    496	  21024	  66672	  10470	Engine_ECU.elf
 Finished building: default.size.stdout
  
