@@ -1,10 +1,10 @@
-01:50:15 **** Incremental Build of configuration Debug for project Engine_ECU ****
+04:45:21 **** Incremental Build of configuration Debug for project Engine_ECU ****
 make -j8 all 
 arm-none-eabi-size  Engine_ECU.elf 
    text	   data	    bss	    dec	    hex	filename
-  45152	    496	  21024	  66672	  10470	Engine_ECU.elf
+  46336	    500	  21020	  67856	  10910	Engine_ECU.elf
 Finished building: default.size.stdout
  
 
-01:50:16 Build Finished. 0 errors, 0 warnings. (took 474ms)
+04:45:22 Build Finished. 0 errors, 0 warnings. (took 1s.71ms)
 

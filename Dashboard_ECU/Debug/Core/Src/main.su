@@ -1,3 +1,10 @@
-../Core/Src/main.c:69:5:main	8	static
-../Core/Src/main.c:127:6:SystemClock_Config	88	static
-../Core/Src/main.c:176:6:Error_Handler	4	static,ignoring_inline_asm
+../Core/Src/main.c:61:6:UART_Log	16	static
+../Core/Src/main.c:66:6:TFT_DrawDashboard	16	static
+../Core/Src/main.c:83:6:TFT_UpdateValues	40	static
+../Core/Src/main.c:105:5:main	160	static
+../Core/Src/main.c:143:6:User_Task_TFT_Update	16	static
+../Core/Src/main.c:152:6:User_Task_ThresholdCheck	16	static
+../Core/Src/main.c:175:6:User_Task_BuzzerHandler	24	static
+../Core/Src/main.c:195:6:HAL_CAN_RxFifo0MsgPendingCallback	56	static
+../Core/Src/main.c:218:6:SystemClock_Config	88	static
+../Core/Src/main.c:241:6:Error_Handler	4	static,ignoring_inline_asm

@@ -1,10 +1,10 @@
-03:49:21 **** Incremental Build of configuration Debug for project Dashboard_ECU ****
+03:58:21 **** Incremental Build of configuration Debug for project Dashboard_ECU ****
 make -j8 all 
 arm-none-eabi-size  Dashboard_ECU.elf 
    text	   data	    bss	    dec	    hex	filename
-  21752	     16	  20552	  42320	   a550	Dashboard_ECU.elf
+  42696	    492	  20900	  64088	   fa58	Dashboard_ECU.elf
 Finished building: default.size.stdout
  
 
-03:49:21 Build Finished. 0 errors, 0 warnings. (took 661ms)
+03:58:22 Build Finished. 0 errors, 0 warnings. (took 519ms)
 

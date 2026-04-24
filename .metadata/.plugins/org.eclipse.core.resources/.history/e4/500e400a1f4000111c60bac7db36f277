@@ -1,0 +1,265 @@
+/* USER CODE BEGIN Header */
+/**
+  ******************************************************************************
+  * @file           : main.c
+  * @brief          : Dashboard ECU — Board 2 — STM32F407 Discovery
+  * CAN Bus Dashboard — Production Firmware v2.1
+  * * MODIFICATIONS (v2.0 -> v2.1):
+  * 1. Removed 0x1FE Emergency Flame handler (Flame sensor retired).
+  * 2. Updated 0x103 logic to reflect Overtemp-only relay status.
+  * 3. Cleaned up DTC display logic for consistent error reporting.
+  ******************************************************************************
+  */
+/* USER CODE END Header */
+
+/* Includes ------------------------------------------------------------------*/
+#include "main.h"
+#include "cmsis_os.h"
+#include "can.h"
+#include "spi.h"
+#include "usart.h"
+#include "gpio.h"
+
+/* Private includes ----------------------------------------------------------*/
+/* USER CODE BEGIN Includes */
+#include <stdio.h>
+#include <string.h>
+#include "st7735.h"
+#include "fonts.h"
+/* USER CODE END Includes */
+
+/* Private variables ---------------------------------------------------------*/
+/* USER CODE BEGIN PV */
+/* Data received from Engine ECU over CAN */
+volatile uint16_t rxRPM     = 0;
+volatile uint8_t  rxSpeed   = 0;
+volatile float    rxTemp    = 0.0f;
+volatile uint8_t  rxRelay   = 0;
+volatile uint8_t  faultCode = 0;
+volatile uint8_t  frameCount = 0;
+
+/* FreeRTOS task handles */
+osThreadId_t tftTaskHandle;
+osThreadId_t thresholdTaskHandle;
+osThreadId_t buzzerTaskHandle;
+
+/* Buzzer flag — safe between interrupt and task */
+volatile uint8_t buzzerFlag  = 0;
+volatile uint8_t buzzerBeeps = 0;
+
+/* DTC string for display */
+char dtcString[20] = "NONE";
+char statusString[20] = "NORMAL";
+/* USER CODE END PV */
+
+/* Private function prototypes -----------------------------------------------*/
+void SystemClock_Config(void);
+void MX_FREERTOS_Init(void);
+/* USER CODE BEGIN PFP */
+void Task_TFT_Update(void *argument);
+void Task_ThresholdCheck(void *argument);
+void Task_BuzzerHandler(void *argument);
+void TFT_DrawDashboard(void);
+void TFT_UpdateValues(void);
+void UART_Log(char *msg);
+/* USER CODE END PFP */
+
+/* USER CODE BEGIN 0 */
+void UART_Log(char *msg)
+{
+  HAL_UART_Transmit(&huart2, (uint8_t*)msg, strlen(msg), 100);
+}
+
+void TFT_DrawDashboard(void)
+{
+  ST7735_FillScreen(ST7735_BLACK);
+  ST7735_FillRectangle(0, 0, 160, 18, ST7735_BLUE);
+  ST7735_WriteString(10, 4, "ECU DASHBOARD V2.1", Font_7x10, ST7735_WHITE, ST7735_BLUE);
+
+  ST7735_DrawRectangle(2, 22, 76, 50, ST7735_CYAN);
+  ST7735_WriteString(5, 25, "RPM", Font_7x10, ST7735_CYAN, ST7735_BLACK);
+
+  ST7735_DrawRectangle(82, 22, 76, 50, ST7735_GREEN);
+  ST7735_WriteString(85, 25, "SPEED", Font_7x10, ST7735_GREEN, ST7735_BLACK);
+
+  ST7735_DrawRectangle(2, 76, 76, 50, ST7735_RED);
+  ST7735_WriteString(5, 79, "TEMP C", Font_7x10, ST7735_RED, ST7735_BLACK);
+
+  ST7735_DrawRectangle(82, 76, 76, 50, ST7735_YELLOW);
+  ST7735_WriteString(85, 79, "STATUS", Font_7x10, ST7735_YELLOW, ST7735_BLACK);
+
+  ST7735_FillRectangle(0, 130, 160, 28, ST7735_DARKGREY);
+  ST7735_WriteString(5, 134, "CAN: 500kbps", Font_7x10, ST7735_WHITE, ST7735_DARKGREY);
+}
+
+void TFT_UpdateValues(void)
+{
+  char buf[16];
+
+  /* RPM Display */
+  if(rxRPM == 0xFFFF) sprintf(buf, "FAULT");
+  else sprintf(buf, "%-5d", rxRPM);
+  ST7735_FillRectangle(4, 38, 72, 18, ST7735_BLACK);
+  ST7735_WriteString(4, 38, buf, Font_11x18, ST7735_CYAN, ST7735_BLACK);
+
+  /* Speed Display */
+  sprintf(buf, "%3d km/h", rxSpeed);
+  ST7735_FillRectangle(84, 38, 72, 18, ST7735_BLACK);
+  ST7735_WriteString(84, 38, buf, Font_7x10, ST7735_GREEN, ST7735_BLACK);
+
+  /* Temp Display */
+  sprintf(buf, "%5.1f", rxTemp);
+  ST7735_FillRectangle(4, 92, 72, 18, ST7735_BLACK);
+  ST7735_WriteString(4, 92, buf, Font_11x18, ST7735_RED, ST7735_BLACK);
+
+  /* Status / DTC Display */
+  ST7735_FillRectangle(84, 92, 72, 18, ST7735_BLACK);
+  uint16_t statusColor = (faultCode > 0) ? ST7735_RED : ST7735_GREEN;
+  ST7735_WriteString(84, 92, dtcString, Font_7x10, statusColor, ST7735_BLACK);
+
+  /* Frame Counter */
+  sprintf(buf, "FRM:%d", frameCount);
+  ST7735_FillRectangle(90, 134, 68, 12, ST7735_DARKGREY);
+  ST7735_WriteString(90, 134, buf, Font_7x10, ST7735_WHITE, ST7735_DARKGREY);
+}
+/* USER CODE END 0 */
+
+int main(void)
+{
+  HAL_Init();
+  SystemClock_Config();
+  MX_GPIO_Init();
+  MX_SPI1_Init();
+  MX_CAN1_Init();
+  MX_USART2_UART_Init();
+
+  /* CAN1 Filter configuration */
+  CAN_FilterTypeDef filter;
+  filter.FilterBank           = 0;
+  filter.FilterMode           = CAN_FILTERMODE_IDMASK;
+  filter.FilterScale          = CAN_FILTERSCALE_32BIT;
+  filter.FilterIdHigh         = 0x0000;
+  filter.FilterIdLow          = 0x0000;
+  filter.FilterMaskIdHigh     = 0x0000;
+  filter.FilterMaskIdLow      = 0x0000;
+  filter.FilterFIFOAssignment = CAN_RX_FIFO0;
+  filter.FilterActivation     = ENABLE;
+  HAL_CAN_ConfigFilter(&hcan1, &filter);
+  HAL_CAN_Start(&hcan1);
+  HAL_CAN_ActivateNotification(&hcan1, CAN_IT_RX_FIFO0_MSG_PENDING);
+
+  ST7735_Init();
+  TFT_DrawDashboard();
+
+  osKernelInitialize();
+
+  tftTaskHandle = osThreadNew(Task_TFT_Update, NULL, &(osThreadAttr_t){.name = "TFTTask", .stack_size = 512, .priority = osPriorityNormal});
+  thresholdTaskHandle = osThreadNew(Task_ThresholdCheck, NULL, &(osThreadAttr_t){.name = "ThreshTask", .stack_size = 512, .priority = osPriorityAboveNormal});
+  buzzerTaskHandle = osThreadNew(Task_BuzzerHandler, NULL, &(osThreadAttr_t){.name = "BuzzTask", .stack_size = 256, .priority = osPriorityNormal});
+
+  osKernelStart();
+  while (1) {}
+}
+
+/* USER CODE BEGIN 4 */
+
+/* ── Task 1: Update TFT ── */
+void Task_TFT_Update(void *argument)
+{
+  for(;;)
+  {
+    TFT_UpdateValues();
+    osDelay(100);
+  }
+}
+
+/* ── Task 2: Threshold & Dashboard Logic ── */
+void Task_ThresholdCheck(void *argument)
+{
+  for(;;)
+  {
+    /* Local logic to match Dashboard state with received CAN data */
+    if(rxRPM == 0xFFFF)
+    {
+      strcpy(dtcString, "P0335-FAIL");
+      faultCode = 1;
+    }
+    else if(rxTemp > 40.0f) /* Matching 40.0C room-demo threshold from Engine ECU */
+    {
+      strcpy(dtcString, "P0217-HOT");
+      faultCode = 1;
+    }
+    else
+    {
+      strcpy(dtcString, "SYSTEM-OK");
+      faultCode = 0;
+    }
+    osDelay(50);
+  }
+}
+
+/* ── Task 3: Buzzer Handler ── */
+void Task_BuzzerHandler(void *argument)
+{
+  for(;;)
+  {
+    if(buzzerFlag)
+    {
+      uint8_t count = buzzerBeeps;
+      buzzerFlag = 0;
+      for(uint8_t i = 0; i < count; i++)
+      {
+        HAL_GPIO_WritePin(GPIOE, GPIO_PIN_0, GPIO_PIN_SET);
+        osDelay(150);
+        HAL_GPIO_WritePin(GPIOE, GPIO_PIN_0, GPIO_PIN_RESET);
+        osDelay(100);
+      }
+    }
+    osDelay(10);
+  }
+}
+
+/* ── CAN RX Callback (Flame Logic Removed) ── */
+void HAL_CAN_RxFifo0MsgPendingCallback(CAN_HandleTypeDef *hcan)
+{
+  CAN_RxHeaderTypeDef rxHeader;
+  uint8_t rxData[8];
+
+  if (HAL_CAN_GetRxMessage(hcan, CAN_RX_FIFO0, &rxHeader, rxData) != HAL_OK) return;
+
+  frameCount++;
+
+  switch(rxHeader.StdId)
+  {
+    case 0x100: /* RPM */
+      rxRPM = ((uint16_t)rxData[0] << 8) | rxData[1];
+      break;
+
+    case 0x101: /* Speed */
+      rxSpeed = rxData[0];
+      break;
+
+    case 0x102: /* Temp */
+      rxTemp = (((uint16_t)rxData[0] << 8) | rxData[1]) / 10.0f;
+      break;
+
+    case 0x103: /* Relay (Overtemp indicator) */
+      rxRelay = rxData[0];
+      HAL_GPIO_WritePin(GPIOE, GPIO_PIN_1, rxData[0] ? GPIO_PIN_SET : GPIO_PIN_RESET);
+      break;
+
+    case 0x1FF: /* DTC Received from Engine ECU */
+    {
+      uint16_t code = ((uint16_t)rxData[1] << 8) | rxData[2];
+      if(code == 0x0335) strcpy(dtcString, "P0335-DTC");
+      else if(code == 0x0217) strcpy(dtcString, "P0217-DTC");
+
+      faultCode = 1;
+      buzzerFlag = 1;
+      buzzerBeeps = 3;
+      break;
+    }
+    /* Case 0x1FE (Flame Sensor) removed entirely */
+  }
+}
+/* USER CODE END 4 */
