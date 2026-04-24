@@ -68,6 +68,7 @@ volatile uint32_t      g_limpTimer   = 0;
 /* Buzzer: set from FaultDetect task, consumed by SensorRead task */
 volatile uint8_t g_buzzerFlag  = 0;
 volatile uint8_t g_buzzerBeeps = 0;
+volatile uint32_t g_adcRaw = 0;
 
 /* CAN TX shared resources */
 CAN_TxHeaderTypeDef g_txHeader;
@@ -351,25 +352,32 @@ static void Task_SensorRead(void *argument)
     for (;;)
     {
         /* Joystick → RPM (only in NORMAL state) */
-        if (g_sysState == SYS_NORMAL)
-        {
-            HAL_ADC_Start(&hadc1);
-            if (HAL_ADC_PollForConversion(&hadc1, 10) == HAL_OK)
-            {
-                uint32_t adc = HAL_ADC_GetValue(&hadc1);
-                /* Map ADC 0–4095 to RPM 800–10000 */
-                g_rpm = (uint16_t)(800UL + ((adc * 9200UL) / 4095UL));
-            }
-            HAL_ADC_Stop(&hadc1);
-        }
-        else if (g_sysState == SYS_LIMP)
-        {
-            g_rpm = 1500;      /* RPM locked in limp mode */
-        }
-        else if (g_sysState == SYS_FAULT)
-        {
-            g_rpm = 0xFFFF;    /* invalid sentinel */
-        }
+    	/* NEW — always read ADC, state machine decides what to use */
+    	uint32_t g_adcRaw= 0;
+    	HAL_ADC_Start(&hadc1);
+    	if (HAL_ADC_PollForConversion(&hadc1, 10) == HAL_OK)
+    		g_adcRaw = HAL_ADC_GetValue(&hadc1);
+    	HAL_ADC_Stop(&hadc1);
+
+    	/* Map 0-4095 → 800-10000 RPM */
+    	uint16_t joystickRPM = (uint16_t)(800UL + ((g_adcRaw* 9200UL) / 4095UL));
+
+    	/* State determines which RPM value is used */
+    	switch (g_sysState)
+    	{
+    	    case SYS_NORMAL:
+    	        g_rpm = joystickRPM;          /* full joystick control */
+    	        break;
+    	    case SYS_LIMP:
+    	        g_rpm = 1500;                 /* locked — ignore joystick */
+    	        break;
+    	    case SYS_FAULT:
+    	        g_rpm = 0xFFFF;              /* invalid sentinel */
+    	        break;
+    	    case SYS_RECOVER:
+    	        g_rpm = joystickRPM;          /* allow joystick during recovery */
+    	        break;
+    	}
         /* SYS_RECOVER: keep last g_rpm, FaultDetect will clear it */
 
         g_speed = (g_rpm == 0xFFFF) ? 0U : (uint8_t)(g_rpm / 40U);
@@ -395,13 +403,15 @@ static void Task_SensorRead(void *argument)
  * Task_CANTransmit — 10 ms period, Normal priority
  * Transmits all 5 regular frames + DTC when fault is active.
  */
+const char *stateLabel[] = {"NORMAL", "FAULT", "LIMP", "RECOVER"};
 static void Task_CANTransmit(void *argument)
 {
-    static const char *stateLabel[] = {"NORMAL", "FAULT ", "LIMP  ", "RECOV "};
-    char logBuf[80];
+
+	//char logBuf[80];
 
     for (;;)
     {
+    	//char logBuf[80];
         /* 0x100 — RPM (2 bytes, MSB first) */
         g_txHeader.StdId = 0x100;
         g_txHeader.DLC   = 2;
@@ -442,17 +452,17 @@ static void Task_CANTransmit(void *argument)
             DTC_Transmit(0x50, 0x03, 0x35); /* P0335 crankshaft sensor */
 
         /* UART diagnostic */
-        snprintf(logBuf, sizeof(logBuf),
-                 "[TX] %s | RPM:%5u | Spd:%3u | Tmp:%6.1fC\r\n",
-                 stateLabel[g_sysState & 0x03], g_rpm, g_speed, g_engTemp);
-        UART_Log(logBuf);
+        char dbg[50];
+        snprintf(dbg, sizeof(dbg), "[DBG] ADC:%lu RPM:%u State:%d\r\n",
+                 g_adcRaw, (unsigned)g_rpm, (int)g_sysState);
+        UART_Log(dbg);
 
-        osDelay(10);
+       osDelay(10);
     }
 }
 
 /*
- * Task_FaultDetect — 5 ms period, AboveNormal priority
+ * Task_FaultDetect D— 5 ms period, AboveNormal priority
  * Implements the 4-state fault management machine.
  *
  * State transitions:
@@ -469,8 +479,7 @@ static void Task_FaultDetect(void *argument)
         uint32_t now = HAL_GetTick();
 
         /* ── Flame sensor: highest priority, immediate override ── */
-        if (HAL_GPIO_ReadPin(GPIOB, GPIO_PIN_1) == GPIO_PIN_RESET &&
-            g_sysState == SYS_NORMAL)
+        if (HAL_GPIO_ReadPin(GPIOB, GPIO_PIN_1) == GPIO_PIN_RESET)
         {
             UART_Log("[FAULT] Flame detected — emergency!\r\n");
             g_sysState    = SYS_FAULT;

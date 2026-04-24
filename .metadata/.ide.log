@@ -2991,3 +2991,7 @@ java.lang.NullPointerException: Cannot invoke "javax.swing.JTextField.getText()"
 2026-04-24 15:52:23,702 [INFO] CADModel:114 - Register for checkConnection events
 2026-04-24 15:52:23,704 [INFO] RtosManager:725 - Active RTOS found at IOC load: FREERTOS [Cortex-M4NS]
 2026-04-24 15:52:23,776 [INFO] OpenFileManager:385 - Restore cursor
+2026-04-24 17:43:07,593 [INFO] Activator:176 - 
+
+
+2026-04-24 17:43:07,595 [INFO] Activator:177 - !SESSION log4j initialized

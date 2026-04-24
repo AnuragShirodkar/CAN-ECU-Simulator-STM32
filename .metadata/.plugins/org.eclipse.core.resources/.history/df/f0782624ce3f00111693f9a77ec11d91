@@ -1,0 +1,686 @@
+/* USER CODE BEGIN Header */
+/**
+  ******************************************************************************
+  * @file           : main.c
+  * @brief          : Main program body
+  ******************************************************************************
+  * @attention
+  *
+  * Copyright (c) 2026 STMicroelectronics.
+  * All rights reserved.
+  *
+  * This software is licensed under terms that can be found in the LICENSE file
+  * in the root directory of this software component.
+  * If no LICENSE file comes with this software, it is provided AS-IS.
+  *
+  ******************************************************************************
+  */
+/* USER CODE END Header */
+/* Includes ------------------------------------------------------------------*/
+#include "main.h"
+#include "cmsis_os.h"
+#include "adc.h"
+#include "can.h"
+#include "spi.h"
+#include "usart.h"
+#include "gpio.h"
+
+/* Private includes ----------------------------------------------------------*/
+/* USER CODE BEGIN Includes */
+#include <stdio.h>
+#include <string.h>
+/* USER CODE END Includes */
+
+/* Private typedef -----------------------------------------------------------*/
+/* USER CODE BEGIN PTD */
+
+/* USER CODE END PTD */
+
+/* Private define ------------------------------------------------------------*/
+/* USER CODE BEGIN PD */
+
+/* USER CODE END PD */
+
+/* Private macro -------------------------------------------------------------*/
+/* USER CODE BEGIN PM */
+
+/* USER CODE END PM */
+
+/* Private variables ---------------------------------------------------------*/
+
+/* USER CODE BEGIN PV */
+typedef enum {
+    SYS_NORMAL  = 0,
+    SYS_FAULT   = 1,
+    SYS_LIMP    = 2,
+    SYS_RECOVER = 3
+} SystemState_t;
+
+/* Shared data — volatile because multiple tasks read/write */
+volatile uint16_t      g_rpm         = 800;
+volatile uint8_t       g_speed       = 0;
+volatile float         g_engTemp     = 25.0f;
+volatile uint8_t       g_faultActive = 0;
+volatile SystemState_t g_sysState    = SYS_NORMAL;
+volatile uint32_t      g_faultTimer  = 0;
+volatile uint32_t      g_limpTimer   = 0;
+
+/* Buzzer: set from FaultDetect task, consumed by SensorRead task */
+volatile uint8_t g_buzzerFlag  = 0;
+volatile uint8_t g_buzzerBeeps = 0;
+
+/* CAN TX shared resources */
+CAN_TxHeaderTypeDef g_txHeader;
+uint8_t             g_txData[8];
+uint32_t            g_txMailbox;
+/* USER CODE END PV */
+
+/* Private function prototypes -----------------------------------------------*/
+void SystemClock_Config(void);
+void MX_FREERTOS_Init(void);
+/* USER CODE BEGIN PFP */
+static void     Task_SensorRead   (void *argument);
+static void     Task_CANTransmit  (void *argument);
+static void     Task_FaultDetect  (void *argument);
+static void     Task_LEDHeartbeat (void *argument);
+static float    MAX6675_ReadTemp  (void);
+static void     UART_Log          (const char *msg);
+static void     DTC_Transmit      (uint8_t b1, uint8_t b2, uint8_t b3);
+static void     Buzzer_Beep       (uint8_t times);
+/* USER CODE END PFP */
+
+/* Private user code ---------------------------------------------------------*/
+/* USER CODE BEGIN 0 */
+static void UART_Log(const char *msg)
+{
+    HAL_UART_Transmit(&huart2, (const uint8_t *)msg, strlen(msg), 100);
+}
+
+/*
+ * Buzzer_Beep — drives PE0 high/low for the requested count.
+ * MUST be called only from a FreeRTOS task (uses osDelay).
+ */
+static void Buzzer_Beep(uint8_t times)
+{
+    for (uint8_t i = 0; i < times; i++) {
+        HAL_GPIO_WritePin(GPIOE, GPIO_PIN_0, GPIO_PIN_SET);
+        osDelay(200);
+        HAL_GPIO_WritePin(GPIOE, GPIO_PIN_0, GPIO_PIN_RESET);
+        osDelay(150);
+    }
+}
+
+/*
+ * DTC_Transmit — sends a 3-byte diagnostic trouble code on CAN ID 0x1FF.
+ * Encoding:  b1 = system byte (0x50 = Powertrain)
+ *            b2 = code high byte
+ *            b3 = code low byte
+ * Examples:  P0335 → 0x50, 0x03, 0x35
+ *            P0217 → 0x50, 0x02, 0x17
+ *            P0219 → 0x50, 0x02, 0x19
+ */
+static void DTC_Transmit(uint8_t b1, uint8_t b2, uint8_t b3)
+{
+    CAN_TxHeaderTypeDef hdr;
+    uint8_t  d[3];
+    uint32_t mb;
+
+    hdr.StdId              = 0x1FF;
+    hdr.IDE                = CAN_ID_STD;
+    hdr.RTR                = CAN_RTR_DATA;
+    hdr.DLC                = 3;
+    hdr.TransmitGlobalTime = DISABLE;
+
+    d[0] = b1;  d[1] = b2;  d[2] = b3;
+    HAL_CAN_AddTxMessage(&hcan1, &hdr, d, &mb);
+}
+
+/*
+ * MAX6675_ReadTemp — reads K-type thermocouple via SPI2.
+ * Returns temperature in °C (resolution 0.25 °C, max 1023.75 °C).
+ * Returns -1.0f if thermocouple is open-circuit (fault bit set).
+ */
+static float MAX6675_ReadTemp(void)
+{
+    uint8_t  rx[2] = {0, 0};
+    uint16_t raw;
+
+    HAL_GPIO_WritePin(GPIOB, GPIO_PIN_10, GPIO_PIN_RESET); /* CS LOW  */
+    HAL_Delay(1);
+    HAL_SPI_Receive(&hspi2, rx, 2, 100);
+    HAL_GPIO_WritePin(GPIOB, GPIO_PIN_10, GPIO_PIN_SET);   /* CS HIGH */
+
+    raw = ((uint16_t)rx[0] << 8) | rx[1];
+
+    if (raw & 0x0004) {            /* bit 2: thermocouple open */
+        UART_Log("[TEMP] Open circuit\r\n");
+        return -1.0f;
+    }
+
+    raw >>= 3;                     /* bits [14:3] = temperature */
+    return (float)raw * 0.25f;
+}
+
+/* USER CODE END 0 */
+
+/**
+  * @brief  The application entry point.
+  * @retval int
+  */
+int main(void)
+{
+
+  /* USER CODE BEGIN 1 */
+
+  /* USER CODE END 1 */
+
+  /* MCU Configuration--------------------------------------------------------*/
+
+  /* Reset of all peripherals, Initializes the Flash interface and the Systick. */
+  HAL_Init();
+
+  /* USER CODE BEGIN Init */
+
+  /* USER CODE END Init */
+
+  /* Configure the system clock */
+  SystemClock_Config();
+
+  /* USER CODE BEGIN SysInit */
+
+  /* USER CODE END SysInit */
+
+  /* Initialize all configured peripherals */
+  MX_GPIO_Init();
+  MX_ADC1_Init();
+  MX_CAN1_Init();
+  MX_SPI2_Init();
+  MX_USART2_UART_Init();
+  /* USER CODE BEGIN 2 */
+  UART_Log("\r\n========================================\r\n");
+      UART_Log("  Engine ECU — STM32F407 — v1.0\r\n");
+      UART_Log("  CAN Bus ECU Simulator\r\n");
+      UART_Log("========================================\r\n");
+
+      /* MAX6675 CS idle-high */
+      HAL_GPIO_WritePin(GPIOB, GPIO_PIN_10, GPIO_PIN_SET);
+
+      /* Buzzer off */
+      HAL_GPIO_WritePin(GPIOE, GPIO_PIN_0, GPIO_PIN_RESET);
+
+      /* CAN1 receive filter: pass all frames */
+      {
+          CAN_FilterTypeDef flt;
+          flt.FilterBank           = 0;
+          flt.FilterMode           = CAN_FILTERMODE_IDMASK;
+          flt.FilterScale          = CAN_FILTERSCALE_32BIT;
+          flt.FilterIdHigh         = 0x0000;
+          flt.FilterIdLow          = 0x0000;
+          flt.FilterMaskIdHigh     = 0x0000;
+          flt.FilterMaskIdLow      = 0x0000;
+          flt.FilterFIFOAssignment = CAN_RX_FIFO0;
+          flt.FilterActivation     = ENABLE;
+          flt.SlaveStartFilterBank = 14;
+
+          if (HAL_CAN_ConfigFilter(&hcan1, &flt) != HAL_OK) {
+              UART_Log("[INIT] CAN1 filter FAILED\r\n");
+              Error_Handler();
+          }
+      }
+      UART_Log("[INIT] CAN1 filter OK\r\n");
+
+      if (HAL_CAN_Start(&hcan1) != HAL_OK) {
+          UART_Log("[INIT] CAN1 start FAILED\r\n");
+          Error_Handler();
+      }
+      UART_Log("[INIT] CAN1 running at 500 kbps\r\n");
+
+      /* TX header static fields */
+      g_txHeader.IDE                = CAN_ID_STD;
+      g_txHeader.RTR                = CAN_RTR_DATA;
+      g_txHeader.TransmitGlobalTime = DISABLE;
+
+      /* Startup beep: 1 short = system ready */
+      HAL_GPIO_WritePin(GPIOE, GPIO_PIN_0, GPIO_PIN_SET);
+      HAL_Delay(300);
+      HAL_GPIO_WritePin(GPIOE, GPIO_PIN_0, GPIO_PIN_RESET);
+
+      UART_Log("[INIT] Starting FreeRTOS scheduler\r\n");
+
+      /* Create tasks */
+      osThreadNew(Task_SensorRead,   NULL,
+          &(const osThreadAttr_t){ .name="SensorRead",
+              .stack_size = 512 * 4,
+              .priority   = osPriorityNormal });
+
+      osThreadNew(Task_CANTransmit,  NULL,
+          &(const osThreadAttr_t){ .name="CANTransmit",
+              .stack_size = 512 * 4,
+              .priority   = osPriorityNormal });
+
+      osThreadNew(Task_FaultDetect,  NULL,
+          &(const osThreadAttr_t){ .name="FaultDetect",
+              .stack_size = 512 * 4,
+              .priority   = osPriorityAboveNormal });
+
+      osThreadNew(Task_LEDHeartbeat, NULL,
+          &(const osThreadAttr_t){ .name="LEDHeart",
+              .stack_size = 256 * 4,
+              .priority   = osPriorityBelowNormal });
+
+      /* Start RTOS scheduler — does not return */
+      osKernelStart();
+
+  /* USER CODE END 2 */
+
+  /* Init scheduler */
+  osKernelInitialize();
+
+  /* Call init function for freertos objects (in cmsis_os2.c) */
+  MX_FREERTOS_Init();
+
+  /* Start scheduler */
+  osKernelStart();
+
+  /* We should never get here as control is now taken by the scheduler */
+
+  /* Infinite loop */
+  /* USER CODE BEGIN WHILE */
+  while (1)
+  {
+    /* USER CODE END WHILE */
+
+    /* USER CODE BEGIN 3 */
+  }
+  /* USER CODE END 3 */
+}
+
+/**
+  * @brief System Clock Configuration
+  * @retval None
+  */
+void SystemClock_Config(void)
+{
+  RCC_OscInitTypeDef RCC_OscInitStruct = {0};
+  RCC_ClkInitTypeDef RCC_ClkInitStruct = {0};
+
+  /** Configure the main internal regulator output voltage
+  */
+  __HAL_RCC_PWR_CLK_ENABLE();
+  __HAL_PWR_VOLTAGESCALING_CONFIG(PWR_REGULATOR_VOLTAGE_SCALE1);
+
+  /** Initializes the RCC Oscillators according to the specified parameters
+  * in the RCC_OscInitTypeDef structure.
+  */
+  RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSE;
+  RCC_OscInitStruct.HSEState = RCC_HSE_ON;
+  RCC_OscInitStruct.PLL.PLLState = RCC_PLL_ON;
+  RCC_OscInitStruct.PLL.PLLSource = RCC_PLLSOURCE_HSE;
+  RCC_OscInitStruct.PLL.PLLM = 8;
+  RCC_OscInitStruct.PLL.PLLN = 336;
+  RCC_OscInitStruct.PLL.PLLP = RCC_PLLP_DIV2;
+  RCC_OscInitStruct.PLL.PLLQ = 7;
+  if (HAL_RCC_OscConfig(&RCC_OscInitStruct) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+  /** Initializes the CPU, AHB and APB buses clocks
+  */
+  RCC_ClkInitStruct.ClockType = RCC_CLOCKTYPE_HCLK|RCC_CLOCKTYPE_SYSCLK
+                              |RCC_CLOCKTYPE_PCLK1|RCC_CLOCKTYPE_PCLK2;
+  RCC_ClkInitStruct.SYSCLKSource = RCC_SYSCLKSOURCE_PLLCLK;
+  RCC_ClkInitStruct.AHBCLKDivider = RCC_SYSCLK_DIV1;
+  RCC_ClkInitStruct.APB1CLKDivider = RCC_HCLK_DIV4;
+  RCC_ClkInitStruct.APB2CLKDivider = RCC_HCLK_DIV2;
+
+  if (HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_5) != HAL_OK)
+  {
+    Error_Handler();
+  }
+}
+
+/* USER CODE BEGIN 4 */
+/*
+ * Task_SensorRead — 10 ms period, Normal priority
+ * Reads joystick ADC → RPM and MAX6675 → temperature.
+ * Also drives buzzer on request from FaultDetect task.
+ */
+static void Task_SensorRead(void *argument)
+{
+    for (;;)
+    {
+        /* Joystick → RPM (only in NORMAL state) */
+        if (g_sysState == SYS_NORMAL)
+        {
+            HAL_ADC_Start(&hadc1);
+            if (HAL_ADC_PollForConversion(&hadc1, 10) == HAL_OK)
+            {
+                uint32_t adc = HAL_ADC_GetValue(&hadc1);
+                /* Map ADC 0–4095 to RPM 800–10000 */
+                g_rpm = (uint16_t)(800UL + ((adc * 9200UL) / 4095UL));
+            }
+            HAL_ADC_Stop(&hadc1);
+        }
+        else if (g_sysState == SYS_LIMP)
+        {
+            g_rpm = 1500;      /* RPM locked in limp mode */
+        }
+        else if (g_sysState == SYS_FAULT)
+        {
+            g_rpm = 0xFFFF;    /* invalid sentinel */
+        }
+        /* SYS_RECOVER: keep last g_rpm, FaultDetect will clear it */
+
+        g_speed = (g_rpm == 0xFFFF) ? 0U : (uint8_t)(g_rpm / 40U);
+
+        /* Temperature read */
+        float t = MAX6675_ReadTemp();
+        if (t >= 0.0f)
+            g_engTemp = t;
+
+        /* Buzzer: safe to run here (task context, not ISR) */
+        if (g_buzzerFlag)
+        {
+            uint8_t n   = g_buzzerBeeps;
+            g_buzzerFlag = 0;
+            Buzzer_Beep(n);
+        }
+
+        osDelay(10);
+    }
+}
+
+/*
+ * Task_CANTransmit — 10 ms period, Normal priority
+ * Transmits all 5 regular frames + DTC when fault is active.
+ */
+static void Task_CANTransmit(void *argument)
+{
+    static const char *stateLabel[] = {"NORMAL", "FAULT ", "LIMP  ", "RECOV "};
+    char logBuf[80];
+
+    for (;;)
+    {
+        /* 0x100 — RPM (2 bytes, MSB first) */
+        g_txHeader.StdId = 0x100;
+        g_txHeader.DLC   = 2;
+        g_txData[0] = (g_rpm >> 8) & 0xFF;
+        g_txData[1] =  g_rpm & 0xFF;
+        HAL_CAN_AddTxMessage(&hcan1, &g_txHeader, g_txData, &g_txMailbox);
+
+        /* 0x101 — Speed (1 byte, km/h) */
+        g_txHeader.StdId = 0x101;
+        g_txHeader.DLC   = 1;
+        g_txData[0]      = g_speed;
+        HAL_CAN_AddTxMessage(&hcan1, &g_txHeader, g_txData, &g_txMailbox);
+
+        /* 0x102 — Engine temperature × 10 (2 bytes, MSB first) */
+        g_txHeader.StdId    = 0x102;
+        g_txHeader.DLC      = 2;
+        {
+            uint16_t tx10 = (uint16_t)(g_engTemp * 10.0f);
+            g_txData[0] = (tx10 >> 8) & 0xFF;
+            g_txData[1] =  tx10 & 0xFF;
+        }
+        HAL_CAN_AddTxMessage(&hcan1, &g_txHeader, g_txData, &g_txMailbox);
+
+        /* 0x103 — Relay command (ON above 800 °C threshold) */
+        g_txHeader.StdId = 0x103;
+        g_txHeader.DLC   = 1;
+        g_txData[0]      = (g_engTemp > 800.0f) ? 0x01U : 0x00U;
+        HAL_CAN_AddTxMessage(&hcan1, &g_txHeader, g_txData, &g_txMailbox);
+
+        /* 0x104 — System state byte */
+        g_txHeader.StdId = 0x104;
+        g_txHeader.DLC   = 1;
+        g_txData[0]      = (uint8_t)g_sysState;
+        HAL_CAN_AddTxMessage(&hcan1, &g_txHeader, g_txData, &g_txMailbox);
+
+        /* 0x1FF — DTC if fault is active */
+        if (g_faultActive)
+            DTC_Transmit(0x50, 0x03, 0x35); /* P0335 crankshaft sensor */
+
+        /* UART diagnostic */
+        snprintf(logBuf, sizeof(logBuf),
+                 "[TX] %s | RPM:%5u | Spd:%3u | Tmp:%6.1fC\r\n",
+                 stateLabel[g_sysState & 0x03], g_rpm, g_speed, g_engTemp);
+        UART_Log(logBuf);
+
+        osDelay(10);
+    }
+}
+
+/*
+ * Task_FaultDetect — 5 ms period, AboveNormal priority
+ * Implements the 4-state fault management machine.
+ *
+ * State transitions:
+ *   NORMAL  →  FAULT   : button press OR overtemperature OR flame
+ *   FAULT   →  LIMP    : 3 s elapsed OR fault condition cleared
+ *   LIMP    →  RECOVER : 5 s elapsed AND sensors safe OR manual button
+ *   RECOVER →  NORMAL  : all sensors safe
+ *   RECOVER →  FAULT   : sensors still unsafe (recovery failed)
+ */
+static void Task_FaultDetect(void *argument)
+{
+    for (;;)
+    {
+        uint32_t now = HAL_GetTick();
+
+        /* ── Flame sensor: highest priority, immediate override ── */
+        if (HAL_GPIO_ReadPin(GPIOB, GPIO_PIN_1) == GPIO_PIN_RESET &&
+            g_sysState == SYS_NORMAL)
+        {
+            UART_Log("[FAULT] Flame detected — emergency!\r\n");
+            g_sysState    = SYS_FAULT;
+            g_faultTimer  = now;
+            g_faultActive = 1;
+            g_rpm         = 0xFFFF;
+
+            /* 0x1FE: emergency broadcast frame */
+            {
+                CAN_TxHeaderTypeDef h;
+                uint8_t  d[1] = {0xFF};
+                uint32_t mb;
+                h.StdId = 0x1FE;  h.IDE = CAN_ID_STD;
+                h.RTR   = CAN_RTR_DATA;  h.DLC = 1;
+                h.TransmitGlobalTime = DISABLE;
+                HAL_CAN_AddTxMessage(&hcan1, &h, d, &mb);
+            }
+            DTC_Transmit(0x50, 0x02, 0x17); /* P0217 overtemp/fire */
+            g_buzzerBeeps = 5;
+            g_buzzerFlag  = 1;
+        }
+
+        /* ── State machine ── */
+        switch (g_sysState)
+        {
+            /* ──────────── NORMAL ──────────── */
+            case SYS_NORMAL:
+                g_faultActive = 0;
+
+                if (HAL_GPIO_ReadPin(GPIOA, GPIO_PIN_0) == GPIO_PIN_RESET)
+                {
+                    /* USER button: inject P0335 crankshaft sensor fault */
+                    UART_Log("[FSM] NORMAL → FAULT (button)\r\n");
+                    g_sysState    = SYS_FAULT;
+                    g_faultTimer  = now;
+                    g_faultActive = 1;
+                    g_rpm         = 0xFFFF;
+                    DTC_Transmit(0x50, 0x03, 0x35);
+                    g_buzzerBeeps = 3;
+                    g_buzzerFlag  = 1;
+                    break;
+                }
+
+                if (g_engTemp > 800.0f)
+                {
+                    /* Overtemperature: inject P0217 */
+                    UART_Log("[FSM] NORMAL → FAULT (overtemp)\r\n");
+                    g_sysState    = SYS_FAULT;
+                    g_faultTimer  = now;
+                    g_faultActive = 1;
+                    DTC_Transmit(0x50, 0x02, 0x17);
+                    g_buzzerBeeps = 2;
+                    g_buzzerFlag  = 1;
+                }
+                break;
+
+            /* ──────────── FAULT ──────────── */
+            case SYS_FAULT:
+                if ((now - g_faultTimer) >= 3000UL)
+                {
+                    /* 3-second timeout: enter limp mode */
+                    UART_Log("[FSM] FAULT → LIMP (3s timeout)\r\n");
+                    g_sysState    = SYS_LIMP;
+                    g_limpTimer   = now;
+                    g_rpm         = 1500;
+                    g_faultActive = 0;
+                    g_buzzerBeeps = 1;
+                    g_buzzerFlag  = 1;
+                    break;
+                }
+
+                /* Fault condition cleared manually */
+                if (HAL_GPIO_ReadPin(GPIOA, GPIO_PIN_0) == GPIO_PIN_SET &&
+                    g_engTemp < 800.0f)
+                {
+                    UART_Log("[FSM] FAULT → LIMP (condition cleared)\r\n");
+                    g_sysState    = SYS_LIMP;
+                    g_limpTimer   = now;
+                    g_rpm         = 1500;
+                    g_faultActive = 0;
+                }
+                break;
+
+            /* ──────────── LIMP ──────────── */
+            case SYS_LIMP:
+                g_rpm = 1500; /* enforce lock every cycle */
+
+                /* Auto-recovery: 5 s in limp with safe conditions */
+                if ((now - g_limpTimer) >= 5000UL)
+                {
+                    if (g_engTemp < 800.0f &&
+                        HAL_GPIO_ReadPin(GPIOA, GPIO_PIN_0) == GPIO_PIN_SET)
+                    {
+                        UART_Log("[FSM] LIMP → RECOVER (auto)\r\n");
+                        g_sysState = SYS_RECOVER;
+                    }
+                }
+
+                /* Manual reset: button press */
+                if (HAL_GPIO_ReadPin(GPIOA, GPIO_PIN_0) == GPIO_PIN_RESET)
+                {
+                    while (HAL_GPIO_ReadPin(GPIOA, GPIO_PIN_0) == GPIO_PIN_RESET)
+                        osDelay(10); /* wait for release */
+                    UART_Log("[FSM] LIMP → RECOVER (manual)\r\n");
+                    g_sysState = SYS_RECOVER;
+                }
+                break;
+
+            /* ──────────── RECOVER ──────────── */
+            case SYS_RECOVER:
+                if (g_engTemp < 800.0f &&
+                    HAL_GPIO_ReadPin(GPIOA, GPIO_PIN_0) == GPIO_PIN_SET)
+                {
+                    UART_Log("[FSM] RECOVER → NORMAL\r\n");
+                    g_sysState    = SYS_NORMAL;
+                    g_faultActive = 0;
+                    g_rpm         = 800;
+                    DTC_Transmit(0x50, 0x0A, 0x01); /* recovery complete */
+                    g_buzzerBeeps = 2;
+                    g_buzzerFlag  = 1;
+                }
+                else
+                {
+                    UART_Log("[FSM] RECOVER FAILED → FAULT\r\n");
+                    g_sysState    = SYS_FAULT;
+                    g_faultTimer  = now;
+                    g_faultActive = 1;
+                }
+                break;
+        }
+
+        osDelay(5);
+    }
+}
+
+/*
+ * Task_LEDHeartbeat — 500 ms period, BelowNormal priority
+ * Maps system state to onboard Discovery LEDs:
+ *   Green  PD12  solid   = NORMAL
+ *   Orange PD13  blink   = LIMP
+ *   Red    PD14  solid   = FAULT
+ *   Green  PD12  blink   = RECOVER
+ */
+static void Task_LEDHeartbeat(void *argument)
+{
+    for (;;)
+    {
+        switch (g_sysState)
+        {
+            case SYS_NORMAL:
+                HAL_GPIO_WritePin(GPIOD, GPIO_PIN_12, GPIO_PIN_SET);
+                HAL_GPIO_WritePin(GPIOD, GPIO_PIN_13, GPIO_PIN_RESET);
+                HAL_GPIO_WritePin(GPIOD, GPIO_PIN_14, GPIO_PIN_RESET);
+                break;
+
+            case SYS_FAULT:
+                HAL_GPIO_WritePin(GPIOD, GPIO_PIN_14, GPIO_PIN_SET);
+                HAL_GPIO_WritePin(GPIOD, GPIO_PIN_12, GPIO_PIN_RESET);
+                HAL_GPIO_WritePin(GPIOD, GPIO_PIN_13, GPIO_PIN_RESET);
+                break;
+
+            case SYS_LIMP:
+                HAL_GPIO_TogglePin(GPIOD,  GPIO_PIN_13);
+                HAL_GPIO_WritePin(GPIOD,   GPIO_PIN_12, GPIO_PIN_RESET);
+                HAL_GPIO_WritePin(GPIOD,   GPIO_PIN_14, GPIO_PIN_RESET);
+                break;
+
+            case SYS_RECOVER:
+                HAL_GPIO_TogglePin(GPIOD,  GPIO_PIN_12);
+                HAL_GPIO_WritePin(GPIOD,   GPIO_PIN_13, GPIO_PIN_RESET);
+                HAL_GPIO_WritePin(GPIOD,   GPIO_PIN_14, GPIO_PIN_RESET);
+                break;
+        }
+
+        osDelay(500);
+    }
+}
+
+/* USER CODE END 4 */
+
+/**
+  * @brief  This function is executed in case of error occurrence.
+  * @retval None
+  */
+void Error_Handler(void)
+{
+  /* USER CODE BEGIN Error_Handler_Debug */
+
+  /* User can add his own implementation to report the HAL error return state */
+  __disable_irq();
+  HAL_GPIO_WritePin(GPIOD, GPIO_PIN_14, GPIO_PIN_SET);
+  while (1)
+  {
+  }
+  /* USER CODE END Error_Handler_Debug */
+}
+
+#ifdef  USE_FULL_ASSERT
+/**
+  * @brief  Reports the name of the source file and the source line number
+  *         where the assert_param error has occurred.
+  * @param  file: pointer to the source file name
+  * @param  line: assert_param error line source number
+  * @retval None
+  */
+void assert_failed(uint8_t *file, uint32_t line)
+{
+  /* USER CODE BEGIN 6 */
+  /* User can add his own implementation to report the file name and line number,
+     ex: printf("Wrong parameters value: file %s on line %d\r\n", file, line) */
+  /* USER CODE END 6 */
+}
+#endif /* USE_FULL_ASSERT */
