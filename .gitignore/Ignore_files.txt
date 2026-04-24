@@ -1,0 +1,21 @@
+# STM32CubeIDE generated
+Debug/
+Release/
+*.o
+*.d
+*.elf
+*.bin
+*.hex
+*.map
+*.lst
+
+# IDE settings
+.settings/
+.cproject
+.project
+*.launch
+
+# Keep these:
+# Core/
+# Drivers/
+# Core/Src/main.c  ← your code 

@@ -1,0 +1,7 @@
+#include "fonts.h"
+
+const uint8_t font5x7[96][5] = {
+    {0,0,0,0,0}, // space
+    {0,0,95,0,0}, // !
+    // Add more if needed
+};

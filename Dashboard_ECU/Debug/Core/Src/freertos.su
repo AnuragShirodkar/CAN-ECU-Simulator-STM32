@@ -1,0 +1,4 @@
+../Core/Src/freertos.c:88:6:MX_FREERTOS_Init	8	static
+../Core/Src/freertos.c:136:6:StartDefaultTask	16	static
+../Core/Src/freertos.c:154:6:Task_ThresholdCheck	16	static
+../Core/Src/freertos.c:172:6:Task_BuzzerHandler	16	static

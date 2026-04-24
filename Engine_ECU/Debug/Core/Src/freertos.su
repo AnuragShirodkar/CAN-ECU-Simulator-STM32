@@ -1,0 +1,5 @@
+../Core/Src/freertos.c:96:6:MX_FREERTOS_Init	8	static
+../Core/Src/freertos.c:147:6:Task_SensorRead	16	static
+../Core/Src/freertos.c:165:6:Task_CANTransmit	16	static
+../Core/Src/freertos.c:183:6:Task_FaultDetect	16	static
+../Core/Src/freertos.c:201:6:Task_LEDHeartbeat	16	static
