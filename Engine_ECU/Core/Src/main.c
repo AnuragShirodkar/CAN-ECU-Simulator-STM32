@@ -1,17 +1,22 @@
-/* ============================================================
-   Engine ECU — Board 1 — STM32F407 Discovery
-   CAN Bus ECU Simulator — Final v3.0
-
-   Features:
-   - Auto fault detection at 40°C (no button needed)
-   - Auto limp mode: RPM locked at 1500 when overtemp
-   - Auto recovery when temp drops below 35°C
-   - MAX6675 thermocouple temperature
-   - Joystick RPM control (800–15000)
-   - FreeRTOS 4-task architecture
-   - CAN frames: 0x100 RPM, 0x101 Speed, 0x102 Temp,
-                  0x103 Relay, 0x104 State, 0x1FF DTC
-   ============================================================ */
+/* USER CODE BEGIN Header */
+/**
+  ******************************************************************************
+  * @file           : main.c
+  * @brief          : Engine ECU — Board 1 — STM32F407 Discovery
+  *                   CAN Bus ECU Simulator — Production Firmware v2.1
+  *
+  * FIX LOG (v2 → v2.1):
+  *   1. Flame sensor removed entirely (was PB1) — no hardware, no logic
+  *   2. Joystick ADC changed to ADC1_IN11 on PC1
+  *      → MX_ADC1_Init() must configure Channel 11 (PC1)
+  *   3. RPM + Speed computed atomically in same step — both update together
+  *   4. Temperature: no changes needed — MAX6675 via SPI2 working correctly
+  *   5. FaultDetect: flame-related branches removed, overtemp still active
+  *   6. CAN 0x103 relay byte: now only overtemp (flame removed)
+  *   7. UART dashboard: Flame column removed
+  ******************************************************************************
+  */
+/* USER CODE END Header */
 
 #include "main.h"
 #include "cmsis_os.h"
@@ -21,17 +26,21 @@
 #include "usart.h"
 #include "gpio.h"
 
+/* USER CODE BEGIN Includes */
 #include <stdio.h>
 #include <string.h>
+/* USER CODE END Includes */
 
-/* ── Thresholds ── */
-#define OVERTEMP_FAULT_C     40.0f   /* above this → FAULT */
-#define OVERTEMP_RECOVER_C   35.0f   /* below this → can recover */
-#define RPM_MIN              800U
-#define RPM_MAX              15000U
-#define LIMP_RPM             1500U
+/* USER CODE BEGIN PD */
+/* Overtemperature threshold — 40.0°C for room-temp demo.
+   Change to 800.0f for real automotive use. */
+#define OVERTEMP_THRESHOLD_C   40.0f
 
-/* ── System state machine ── */
+#define RPM_MIN   800U
+#define RPM_MAX   15000U
+/* USER CODE END PD */
+
+/* USER CODE BEGIN PV */
 typedef enum {
     SYS_NORMAL  = 0,
     SYS_FAULT   = 1,
@@ -39,16 +48,23 @@ typedef enum {
     SYS_RECOVER = 3
 } SystemState_t;
 
-/* ── Global shared variables ── */
+/* ── Shared sensor data ── */
 volatile uint16_t      g_rpm          = RPM_MIN;
 volatile uint8_t       g_speed        = 0;
 volatile float         g_engTemp      = 25.0f;
-volatile uint32_t      g_adcRaw       = 2048;   /* mid joystick default */
+/* g_flameSeen REMOVED */
+
+/* ── State machine ── */
 volatile uint8_t       g_faultActive  = 0;
 volatile SystemState_t g_sysState     = SYS_NORMAL;
 volatile uint32_t      g_faultTimer   = 0;
 volatile uint32_t      g_limpTimer    = 0;
 volatile uint32_t      g_recoverTimer = 0;
+
+/* ── Raw ADC (PC1 / ADC1_IN11) ── */
+volatile uint32_t      g_adcRaw       = 0;
+
+/* ── Buzzer ── */
 volatile uint8_t       g_buzzerFlag   = 0;
 volatile uint8_t       g_buzzerBeeps  = 0;
 
@@ -56,8 +72,13 @@ volatile uint8_t       g_buzzerBeeps  = 0;
 CAN_TxHeaderTypeDef    g_txHeader;
 uint8_t                g_txData[8];
 uint32_t               g_txMailbox;
+/* USER CODE END PV */
 
-/* ── Function prototypes ── */
+/* Private function prototypes */
+void SystemClock_Config(void);
+void MX_FREERTOS_Init(void);
+
+/* USER CODE BEGIN PFP */
 static void  Task_SensorRead   (void *argument);
 static void  Task_CANTransmit  (void *argument);
 static void  Task_FaultDetect  (void *argument);
@@ -66,203 +87,299 @@ static float MAX6675_ReadTemp  (void);
 static void  UART_Log          (const char *msg);
 static void  DTC_Transmit      (uint8_t b1, uint8_t b2, uint8_t b3);
 static void  Buzzer_Beep       (uint8_t times);
+/* USER CODE END PFP */
 
-/* ================================================================
-   HELPER FUNCTIONS
-   ================================================================ */
+/* USER CODE BEGIN 0 */
 
-static void UART_Log(const char *msg) {
+/* ── UART_Log ── */
+static void UART_Log(const char *msg)
+{
     HAL_UART_Transmit(&huart2, (const uint8_t *)msg, strlen(msg), 200);
 }
 
-static void Buzzer_Beep(uint8_t times) {
+/* ── Buzzer_Beep ── */
+static void Buzzer_Beep(uint8_t times)
+{
     for (uint8_t i = 0; i < times; i++) {
         HAL_GPIO_WritePin(GPIOE, GPIO_PIN_0, GPIO_PIN_SET);
-        osDelay(300);
-        HAL_GPIO_WritePin(GPIOE, GPIO_PIN_0, GPIO_PIN_RESET);
         osDelay(200);
+        HAL_GPIO_WritePin(GPIOE, GPIO_PIN_0, GPIO_PIN_RESET);
+        osDelay(150);
     }
 }
 
-static void DTC_Transmit(uint8_t b1, uint8_t b2, uint8_t b3) {
+/* ── DTC_Transmit ── */
+static void DTC_Transmit(uint8_t b1, uint8_t b2, uint8_t b3)
+{
     CAN_TxHeaderTypeDef hdr;
-    uint8_t  d[3] = {b1, b2, b3};
+    uint8_t  d[3];
     uint32_t mb;
+
     hdr.StdId              = 0x1FF;
     hdr.IDE                = CAN_ID_STD;
     hdr.RTR                = CAN_RTR_DATA;
     hdr.DLC                = 3;
     hdr.TransmitGlobalTime = DISABLE;
+
+    d[0] = b1;  d[1] = b2;  d[2] = b3;
     HAL_CAN_AddTxMessage(&hcan1, &hdr, d, &mb);
 }
 
-static float MAX6675_ReadTemp(void) {
+/* ── MAX6675_ReadTemp ──
+   Reads K-type thermocouple via SPI2, PB10 = CS.
+   Returns °C (0.25°C resolution), or -1.0f if open-circuit.               */
+static float MAX6675_ReadTemp(void)
+{
     uint8_t  rx[2] = {0, 0};
     uint16_t raw;
 
-    HAL_GPIO_WritePin(GPIOB, GPIO_PIN_10, GPIO_PIN_RESET); /* CS LOW */
+    HAL_GPIO_WritePin(GPIOB, GPIO_PIN_10, GPIO_PIN_RESET); /* CS LOW  */
     osDelay(1);
-    if (HAL_SPI_Receive(&hspi2, rx, 2, 100) != HAL_OK) {
-        HAL_GPIO_WritePin(GPIOB, GPIO_PIN_10, GPIO_PIN_SET);
-        return -2.0f; /* SPI error */
-    }
-    HAL_GPIO_WritePin(GPIOB, GPIO_PIN_10, GPIO_PIN_SET); /* CS HIGH */
+    HAL_SPI_Receive(&hspi2, rx, 2, 100);
+    HAL_GPIO_WritePin(GPIOB, GPIO_PIN_10, GPIO_PIN_SET);   /* CS HIGH */
 
     raw = ((uint16_t)rx[0] << 8) | rx[1];
 
-    /* Debug raw SPI bytes */
-    char dbg[40];
-    snprintf(dbg, sizeof(dbg), "[SPI] Raw: %02X %02X\r\n", rx[0], rx[1]);
-    UART_Log(dbg);
-
     if (raw & 0x0004) {
-        UART_Log("[TEMP] Open circuit — check thermocouple\r\n");
+        UART_Log("[TEMP] Open-circuit — check thermocouple wiring\r\n");
         return -1.0f;
     }
 
-    raw >>= 3;  /* bits [14:3] */
+    raw >>= 3;
     return (float)raw * 0.25f;
 }
 
-/* ================================================================
-   MAIN
-   ================================================================ */
+/* USER CODE END 0 */
+
 int main(void)
 {
-    HAL_Init();
-    SystemClock_Config();
-    MX_GPIO_Init();
-    MX_ADC1_Init();
-    MX_CAN1_Init();
-    MX_SPI2_Init();
-    MX_USART2_UART_Init();
+  /* USER CODE BEGIN 1 */
+  /* USER CODE END 1 */
 
-    /* Peripherals init */
-    HAL_GPIO_WritePin(GPIOB, GPIO_PIN_10, GPIO_PIN_SET);   /* MAX6675 CS high */
-    HAL_GPIO_WritePin(GPIOE, GPIO_PIN_0,  GPIO_PIN_RESET); /* Buzzer off */
+  HAL_Init();
 
-    /* CAN filter — accept all */
-    CAN_FilterTypeDef flt = {0};
-    flt.FilterBank           = 0;
-    flt.FilterMode           = CAN_FILTERMODE_IDMASK;
-    flt.FilterScale          = CAN_FILTERSCALE_32BIT;
-    flt.FilterActivation     = ENABLE;
-    flt.FilterFIFOAssignment = CAN_RX_FIFO0;
-    flt.SlaveStartFilterBank = 14;
-    HAL_CAN_ConfigFilter(&hcan1, &flt);
-    HAL_CAN_Start(&hcan1);
+  /* USER CODE BEGIN Init */
+  /* USER CODE END Init */
 
-    /* TX header defaults */
-    g_txHeader.IDE                = CAN_ID_STD;
-    g_txHeader.RTR                = CAN_RTR_DATA;
-    g_txHeader.TransmitGlobalTime = DISABLE;
+  SystemClock_Config();
 
-    /* Boot messages */
-    UART_Log("\r\n================================================\r\n");
-    UART_Log("  ENGINE ECU  |  STM32F407  |  v3.0 FINAL\r\n");
-    UART_Log("  Auto fault at 40C | Limp at 1500 RPM\r\n");
-    UART_Log("  Recovery at 35C   | No button needed\r\n");
-    UART_Log("================================================\r\n\r\n");
+  /* USER CODE BEGIN SysInit */
+  /* USER CODE END SysInit */
 
-    /* Startup beep */
-    HAL_GPIO_WritePin(GPIOE, GPIO_PIN_0, GPIO_PIN_SET);
-    HAL_Delay(300);
-    HAL_GPIO_WritePin(GPIOE, GPIO_PIN_0, GPIO_PIN_RESET);
+  MX_GPIO_Init();
+  MX_ADC1_Init();    /* !! Must configure ADC1 Channel 11 (PC1) in CubeMX !! */
+  MX_CAN1_Init();
+  MX_SPI2_Init();
+  MX_USART2_UART_Init();
 
-    /* Create FreeRTOS tasks */
-    osThreadNew(Task_SensorRead,   NULL, &(const osThreadAttr_t){
-        .name="Sensor", .stack_size=2048, .priority=osPriorityNormal });
+  /* USER CODE BEGIN 2 */
+  UART_Log("\r\n");
+  UART_Log("================================================\r\n");
+  UART_Log("  ENGINE ECU  |  STM32F407  |  Firmware v2.1  \r\n");
+  UART_Log("  CAN Bus ECU Simulator — Automotive Demo      \r\n");
+  UART_Log("  Joystick    : PC1 / ADC1_IN11               \r\n");
+  UART_Log("  Overtemp    : 40.0 C (room demo)             \r\n");
+  UART_Log("  Max RPM     : 15000                          \r\n");
+  UART_Log("  Flame sensor: DISABLED                       \r\n");
+  UART_Log("================================================\r\n\r\n");
 
-    osThreadNew(Task_CANTransmit,  NULL, &(const osThreadAttr_t){
-        .name="CAN", .stack_size=2048, .priority=osPriorityNormal });
+  /* MAX6675 CS idle-high */
+  HAL_GPIO_WritePin(GPIOB, GPIO_PIN_10, GPIO_PIN_SET);
 
-    osThreadNew(Task_FaultDetect,  NULL, &(const osThreadAttr_t){
-        .name="Fault", .stack_size=2048, .priority=osPriorityAboveNormal });
+  /* Buzzer off */
+  HAL_GPIO_WritePin(GPIOE, GPIO_PIN_0, GPIO_PIN_RESET);
 
-    osThreadNew(Task_LEDHeartbeat, NULL, &(const osThreadAttr_t){
-        .name="LED", .stack_size=1024, .priority=osPriorityBelowNormal });
+  /* CAN1 receive filter — pass all frames */
+  {
+      CAN_FilterTypeDef flt;
+      flt.FilterBank           = 0;
+      flt.FilterMode           = CAN_FILTERMODE_IDMASK;
+      flt.FilterScale          = CAN_FILTERSCALE_32BIT;
+      flt.FilterIdHigh         = 0x0000;
+      flt.FilterIdLow          = 0x0000;
+      flt.FilterMaskIdHigh     = 0x0000;
+      flt.FilterMaskIdLow      = 0x0000;
+      flt.FilterFIFOAssignment = CAN_RX_FIFO0;
+      flt.FilterActivation     = ENABLE;
+      flt.SlaveStartFilterBank = 14;
 
-    osKernelInitialize();
-    MX_FREERTOS_Init();
-    osKernelStart();
-    while (1) {}
+      if (HAL_CAN_ConfigFilter(&hcan1, &flt) != HAL_OK) {
+          UART_Log("[INIT] ERROR: CAN1 filter config FAILED\r\n");
+          Error_Handler();
+      }
+  }
+  UART_Log("[INIT] CAN1 filter     : OK\r\n");
+
+  if (HAL_CAN_Start(&hcan1) != HAL_OK) {
+      UART_Log("[INIT] ERROR: CAN1 start FAILED\r\n");
+      Error_Handler();
+  }
+  UART_Log("[INIT] CAN1 bus        : Running @ 500 kbps\r\n");
+
+  /* TX header static fields */
+  g_txHeader.IDE                = CAN_ID_STD;
+  g_txHeader.RTR                = CAN_RTR_DATA;
+  g_txHeader.TransmitGlobalTime = DISABLE;
+
+  /* Startup beep — 1 short = system ready */
+  HAL_GPIO_WritePin(GPIOE, GPIO_PIN_0, GPIO_PIN_SET);
+  HAL_Delay(300);
+  HAL_GPIO_WritePin(GPIOE, GPIO_PIN_0, GPIO_PIN_RESET);
+
+  UART_Log("[INIT] Peripherals     : OK\r\n");
+  UART_Log("[INIT] Starting FreeRTOS...\r\n\r\n");
+
+  osThreadNew(Task_SensorRead,   NULL,
+      &(const osThreadAttr_t){ .name="SensorRead",
+          .stack_size = 512 * 4,
+          .priority   = osPriorityNormal });
+
+  osThreadNew(Task_CANTransmit,  NULL,
+      &(const osThreadAttr_t){ .name="CANTransmit",
+          .stack_size = 512 * 4,
+          .priority   = osPriorityNormal });
+
+  osThreadNew(Task_FaultDetect,  NULL,
+      &(const osThreadAttr_t){ .name="FaultDetect",
+          .stack_size = 512 * 4,
+          .priority   = osPriorityAboveNormal });
+
+  osThreadNew(Task_LEDHeartbeat, NULL,
+      &(const osThreadAttr_t){ .name="LEDHeart",
+          .stack_size = 256 * 4,
+          .priority   = osPriorityBelowNormal });
+
+  /* USER CODE END 2 */
+
+  osKernelInitialize();
+  MX_FREERTOS_Init();
+  osKernelStart();
+
+  while (1) {}
 }
 
-/* ================================================================
-   TASK 1 — Sensor Read (50ms)
-   Reads joystick ADC + MAX6675 temp
-   ================================================================ */
+/* ── SystemClock_Config ── */
+void SystemClock_Config(void)
+{
+  RCC_OscInitTypeDef RCC_OscInitStruct = {0};
+  RCC_ClkInitTypeDef RCC_ClkInitStruct = {0};
+
+  __HAL_RCC_PWR_CLK_ENABLE();
+  __HAL_PWR_VOLTAGESCALING_CONFIG(PWR_REGULATOR_VOLTAGE_SCALE1);
+
+  RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSE;
+  RCC_OscInitStruct.HSEState       = RCC_HSE_ON;
+  RCC_OscInitStruct.PLL.PLLState   = RCC_PLL_ON;
+  RCC_OscInitStruct.PLL.PLLSource  = RCC_PLLSOURCE_HSE;
+  RCC_OscInitStruct.PLL.PLLM       = 8;
+  RCC_OscInitStruct.PLL.PLLN       = 336;
+  RCC_OscInitStruct.PLL.PLLP       = RCC_PLLP_DIV2;
+  RCC_OscInitStruct.PLL.PLLQ       = 7;
+  if (HAL_RCC_OscConfig(&RCC_OscInitStruct) != HAL_OK) Error_Handler();
+
+  RCC_ClkInitStruct.ClockType      = RCC_CLOCKTYPE_HCLK | RCC_CLOCKTYPE_SYSCLK
+                                   | RCC_CLOCKTYPE_PCLK1 | RCC_CLOCKTYPE_PCLK2;
+  RCC_ClkInitStruct.SYSCLKSource   = RCC_SYSCLKSOURCE_PLLCLK;
+  RCC_ClkInitStruct.AHBCLKDivider  = RCC_SYSCLK_DIV1;
+  RCC_ClkInitStruct.APB1CLKDivider = RCC_HCLK_DIV4;
+  RCC_ClkInitStruct.APB2CLKDivider = RCC_HCLK_DIV2;
+  if (HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_5) != HAL_OK) Error_Handler();
+}
+
+/* USER CODE BEGIN 4 */
+
+/* ══════════════════════════════════════════════════════════════════
+   Task_SensorRead  |  Priority: Normal  |  Period: 50 ms
+   ─────────────────────────────────────────────────────────────────
+   Joystick on PC1 / ADC1_IN11:
+     - ADC reads PC1 (configured as ADC1_IN11 in CubeMX)
+     - Maps 0–4095 → RPM_MIN–RPM_MAX
+     - Speed computed atomically right after RPM — both update together
+   Temperature:
+     - MAX6675 read every cycle via SPI2
+   Flame sensor:
+     - REMOVED entirely
+   ══════════════════════════════════════════════════════════════════ */
 static void Task_SensorRead(void *argument)
 {
     for (;;)
     {
-        /* Read joystick ADC */
+        /* ── ADC read: PC1 / ADC1_IN11 ──────────────────────────────────
+           CubeMX must have ADC1 Channel 11 selected with PC1 as analog.
+           No code change needed here beyond using hadc1 as configured.   */
         HAL_ADC_Start(&hadc1);
         if (HAL_ADC_PollForConversion(&hadc1, 10) == HAL_OK)
             g_adcRaw = HAL_ADC_GetValue(&hadc1);
         HAL_ADC_Stop(&hadc1);
 
-        /* Map ADC to RPM */
-        uint16_t joyRPM = (uint16_t)(RPM_MIN +
-            ((g_adcRaw * (uint32_t)(RPM_MAX - RPM_MIN)) / 4095UL));
+        /* ── Map ADC → joystick RPM (800–15000) ── */
+        uint16_t joystickRPM = (uint16_t)(RPM_MIN +
+                               ((g_adcRaw * (uint32_t)(RPM_MAX - RPM_MIN)) / 4095UL));
 
-        /* State selects RPM */
-        switch (g_sysState) {
-            case SYS_NORMAL:  g_rpm = joyRPM;    break;
-            case SYS_LIMP:    g_rpm = LIMP_RPM;  break;
-            case SYS_FAULT:   g_rpm = 0xFFFFU;   break;
-            case SYS_RECOVER: g_rpm = LIMP_RPM;  break;
-            default:          g_rpm = RPM_MIN;    break;
+        /* ── State machine selects active RPM ── */
+        uint16_t activeRPM;
+        switch (g_sysState)
+        {
+            case SYS_NORMAL:  activeRPM = joystickRPM; break;
+            case SYS_LIMP:    activeRPM = 1500U;        break;
+            case SYS_FAULT:   activeRPM = 0xFFFFU;      break;
+            case SYS_RECOVER: activeRPM = joystickRPM;  break;
+            default:          activeRPM = RPM_MIN;       break;
         }
+        g_rpm = activeRPM;
 
-        /* Speed: rpm/40, capped at 250 */
+        /* ── Speed: computed atomically right after RPM ──────────────────
+           Both g_rpm and g_speed are set in the same task iteration so
+           they are always consistent when CANTransmit reads them.
+           Formula: speed_kmh = rpm / 40, capped at 250 km/h.             */
         if (g_rpm == 0xFFFFU) {
-            g_speed = 0;
+            g_speed = 0U;
         } else {
-            uint32_t s = (uint32_t)g_rpm / 40U;
-            g_speed = (s > 250U) ? 250U : (uint8_t)s;
+            uint32_t spd = (uint32_t)g_rpm / 40U;
+            g_speed = (spd > 250U) ? 250U : (uint8_t)spd;
         }
 
-        /* Read temperature */
+        /* ── Temperature: MAX6675 via SPI2 ── */
         float t = MAX6675_ReadTemp();
-        if (t >= 0.0f) g_engTemp = t;
+        if (t >= 0.0f)
+            g_engTemp = t;
 
-        /* Handle buzzer from this task (safe osDelay context) */
+        /* ── Buzzer ── */
         if (g_buzzerFlag) {
             uint8_t n    = g_buzzerBeeps;
             g_buzzerFlag = 0;
             Buzzer_Beep(n);
         }
 
-        osDelay(50);
+        osDelay(50);   /* 50 ms = 20 Hz update rate */
     }
 }
 
-/* ================================================================
-   TASK 2 — CAN Transmit (10ms)
-   Sends all CAN frames + UART dashboard every 500ms
-   ================================================================ */
+/* ══════════════════════════════════════════════════════════════════
+   Task_CANTransmit  |  Priority: Normal  |  Period: 10 ms
+   ══════════════════════════════════════════════════════════════════ */
+static const char *stateLabel[] = {"NORMAL", "FAULT ", "LIMP  ", "RECOV "};
+
 static void Task_CANTransmit(void *argument)
 {
     uint32_t lastPrint = 0;
-    static const char *labels[] = {"NORMAL", "FAULT ", "LIMP  ", "RECOV "};
 
     for (;;)
     {
-        /* 0x100 — RPM (2 bytes) */
+        /* ── 0x100 — RPM (2 bytes, big-endian) ── */
         g_txHeader.StdId = 0x100;
         g_txHeader.DLC   = 2;
         g_txData[0] = (g_rpm >> 8) & 0xFF;
         g_txData[1] =  g_rpm & 0xFF;
         HAL_CAN_AddTxMessage(&hcan1, &g_txHeader, g_txData, &g_txMailbox);
 
-        /* 0x101 — Speed (1 byte) */
+        /* ── 0x101 — Speed (1 byte, km/h) ── */
         g_txHeader.StdId = 0x101;
         g_txHeader.DLC   = 1;
         g_txData[0]      = g_speed;
         HAL_CAN_AddTxMessage(&hcan1, &g_txHeader, g_txData, &g_txMailbox);
 
-        /* 0x102 — Temperature × 10 (2 bytes) */
+        /* ── 0x102 — Temperature × 10 (2 bytes, big-endian) ── */
         g_txHeader.StdId = 0x102;
         g_txHeader.DLC   = 2;
         {
@@ -272,42 +389,38 @@ static void Task_CANTransmit(void *argument)
         }
         HAL_CAN_AddTxMessage(&hcan1, &g_txHeader, g_txData, &g_txMailbox);
 
-        /* 0x103 — Relay (ON when overtemp) */
+        /* ── 0x103 — Relay: 1 = overtemp only (flame sensor removed) ── */
         g_txHeader.StdId = 0x103;
         g_txHeader.DLC   = 1;
-        g_txData[0]      = (g_engTemp > OVERTEMP_FAULT_C) ? 0x01U : 0x00U;
+        g_txData[0] = (g_engTemp > OVERTEMP_THRESHOLD_C) ? 0x01U : 0x00U;
         HAL_CAN_AddTxMessage(&hcan1, &g_txHeader, g_txData, &g_txMailbox);
 
-        /* 0x104 — System state */
+        /* ── 0x104 — System state ── */
         g_txHeader.StdId = 0x104;
         g_txHeader.DLC   = 1;
         g_txData[0]      = (uint8_t)g_sysState;
         HAL_CAN_AddTxMessage(&hcan1, &g_txHeader, g_txData, &g_txMailbox);
 
-        /* 0x1FF — DTC when fault active */
+        /* ── 0x1FF — DTC if fault active ── */
         if (g_faultActive)
-            DTC_Transmit(0x50, 0x02, 0x17); /* P0217 overtemp */
+            DTC_Transmit(0x50, 0x03, 0x35); /* P0335 crankshaft sensor */
 
-        /* UART dashboard every 500ms */
+        /* ── UART dashboard — every 500 ms ── */
         uint32_t now = HAL_GetTick();
-        if ((now - lastPrint) >= 500UL) {
+        if ((now - lastPrint) >= 500UL)
+        {
             lastPrint = now;
-            uint16_t dispRPM = (g_rpm == 0xFFFFU) ? 0U : g_rpm;
 
-            /* Temp as integers (nano.specs float fix) */
-            int16_t tw = (int16_t)g_engTemp;
-            uint8_t tf = (uint8_t)((g_engTemp - (float)tw) * 10.0f);
+            uint16_t displayRPM = (g_rpm == 0xFFFFU) ? 0U : g_rpm;
 
-            char line[160];
+            char line[120];
             snprintf(line, sizeof(line),
-                "+-------------------------------------------------+\r\n"
-                "| State: %-6s | RPM: %5u | Spd: %3u km/h |\r\n"
-                "| Temp:  %3d.%uC   | ADC: %4lu             |\r\n"
-                "+-------------------------------------------------+\r\n",
-                labels[g_sysState & 0x03],
-                (unsigned)dispRPM,
+                "[ ECU ] State:%-6s | RPM:%5u | Spd:%3u km/h | "
+                "Tmp:%5.1f C | ADC:%4lu\r\n",
+                stateLabel[g_sysState],
+                (unsigned)displayRPM,
                 (unsigned)g_speed,
-                tw, tf,
+                (double)g_engTemp,
                 (unsigned long)g_adcRaw);
             UART_Log(line);
         }
@@ -316,86 +429,128 @@ static void Task_CANTransmit(void *argument)
     }
 }
 
-/* ================================================================
-   TASK 3 — Fault Detection (5ms)
-   Pure automatic — temperature driven state machine
-   No button interaction
-   ================================================================ */
+/* ══════════════════════════════════════════════════════════════════
+   Task_FaultDetect  |  Priority: AboveNormal  |  Period: 5 ms
+   ─────────────────────────────────────────────────────────────────
+   Flame sensor checks REMOVED.
+   Remaining fault sources:
+     • USER button PA0 (active-low) → P0335
+     • Overtemperature              → P0217
+   ══════════════════════════════════════════════════════════════════ */
+/* ── Button debounce helper ─────────────────────────────────────────────────
+   STM32F407 Discovery: PA0 USER button is ACTIVE-HIGH.
+   Idle = GPIO_PIN_RESET (0), Pressed = GPIO_PIN_SET (1).
+   Returns 1 only on a clean press+release with 50 ms debounce.             */
+static uint8_t Button_PressDetected(void)
+{
+    /* Check pressed (HIGH) */
+    if (HAL_GPIO_ReadPin(GPIOA, GPIO_PIN_0) == GPIO_PIN_SET)
+    {
+        osDelay(50);  /* debounce settle */
+        if (HAL_GPIO_ReadPin(GPIOA, GPIO_PIN_0) == GPIO_PIN_SET)
+        {
+            /* Wait for release */
+            while (HAL_GPIO_ReadPin(GPIOA, GPIO_PIN_0) == GPIO_PIN_SET)
+                osDelay(10);
+            osDelay(50);  /* debounce on release */
+            return 1;
+        }
+    }
+    return 0;
+}
+
 static void Task_FaultDetect(void *argument)
 {
-    /* 1 second startup settle — prevents boot false triggers */
     osDelay(1000);
-    UART_Log("[FSM] Fault detection active\r\n");
-
     for (;;)
     {
         uint32_t now = HAL_GetTick();
 
         switch (g_sysState)
         {
-            /* ══ NORMAL: monitor temperature ══ */
+            /* ══ NORMAL ══ */
             case SYS_NORMAL:
                 g_faultActive = 0;
 
-                if (g_engTemp > OVERTEMP_FAULT_C)
+                /* USER button (PA0 active-HIGH) → inject P0335
+                   FIX: was checking GPIO_PIN_RESET (always true at idle!) */
+                if (Button_PressDetected())
                 {
-                    char msg[80];
-                    int16_t tw = (int16_t)g_engTemp;
-                    uint8_t tf = (uint8_t)((g_engTemp - tw) * 10.0f);
-                    snprintf(msg, sizeof(msg),
-                        "[FSM] NORMAL → FAULT (Temp %d.%uC > 40C)\r\n", tw, tf);
-                    UART_Log(msg);
-
+                    UART_Log("\r\n[FSM] NORMAL → FAULT  (USER button — P0335 injected)\r\n");
                     g_sysState    = SYS_FAULT;
                     g_faultTimer  = now;
                     g_faultActive = 1;
-                    DTC_Transmit(0x50, 0x02, 0x17); /* P0217 */
-                    g_buzzerBeeps = 2;   /* 2 beeps for overtemp */
+                    g_rpm         = 0xFFFF;
+                    DTC_Transmit(0x50, 0x03, 0x35);
+                    g_buzzerBeeps = 3;
+                    g_buzzerFlag  = 1;
+                    break;
+                }
+
+                /* Overtemperature → P0217 */
+                if (g_engTemp > OVERTEMP_THRESHOLD_C)
+                {
+                    char msg[80];
+                    snprintf(msg, sizeof(msg),
+                        "\r\n[FSM] NORMAL → FAULT  (Overtemp %.1fC > %.1fC — P0217)\r\n",
+                        (double)g_engTemp, (double)OVERTEMP_THRESHOLD_C);
+                    UART_Log(msg);
+                    g_sysState    = SYS_FAULT;
+                    g_faultTimer  = now;
+                    g_faultActive = 1;
+                    DTC_Transmit(0x50, 0x02, 0x17);
+                    g_buzzerBeeps = 2;
                     g_buzzerFlag  = 1;
                 }
                 break;
 
-            /* ══ FAULT: wait 3s then enter limp ══ */
+            /* ══ FAULT ══ */
             case SYS_FAULT:
                 if ((now - g_faultTimer) >= 3000UL)
                 {
-                    UART_Log("[FSM] FAULT → LIMP (3s timeout)\r\n");
+                    UART_Log("[FSM] FAULT  → LIMP   (3s timeout — engine limited)\r\n");
                     g_sysState    = SYS_LIMP;
                     g_limpTimer   = now;
+                    g_rpm         = 1500;
                     g_faultActive = 0;
                     g_buzzerBeeps = 1;
                     g_buzzerFlag  = 1;
                 }
                 break;
 
-            /* ══ LIMP: RPM locked, wait for temp to drop ══ */
+            /* ══ LIMP ══ */
             case SYS_LIMP:
-                /* Check if temp has recovered to safe level */
-                if (g_engTemp < OVERTEMP_RECOVER_C)
+                g_rpm = 1500;
+
+                /* Auto-recovery: 5 s + temp safe + button NOT pressed */
+                if ((now - g_limpTimer) >= 5000UL)
                 {
-                    /* Must be below threshold for 5 seconds */
-                    if ((now - g_limpTimer) >= 5000UL)
+                    if (g_engTemp < OVERTEMP_THRESHOLD_C &&
+                        HAL_GPIO_ReadPin(GPIOA, GPIO_PIN_0) == GPIO_PIN_RESET) /* idle=LOW */
                     {
-                        UART_Log("[FSM] LIMP → RECOVER (temp safe for 5s)\r\n");
+                        UART_Log("[FSM] LIMP   → RECOVER (auto — sensors safe)\r\n");
                         g_sysState     = SYS_RECOVER;
                         g_recoverTimer = now;
                     }
                 }
-                else
+
+                /* Manual recovery via button press+release */
+                if (Button_PressDetected())
                 {
-                    /* Temp still high — reset the 5s timer */
-                    g_limpTimer = now;
+                    UART_Log("[FSM] LIMP   → RECOVER (manual button)\r\n");
+                    g_sysState     = SYS_RECOVER;
+                    g_recoverTimer = now;
                 }
                 break;
 
-            /* ══ RECOVER: 2s settle then back to normal ══ */
+            /* ══ RECOVER ══ */
             case SYS_RECOVER:
                 if ((now - g_recoverTimer) >= 2000UL)
                 {
-                    if (g_engTemp < OVERTEMP_RECOVER_C)
+                    if (g_engTemp < OVERTEMP_THRESHOLD_C)
                     {
-                        UART_Log("[FSM] RECOVER → NORMAL (all clear)\r\n");
-                        DTC_Transmit(0x50, 0x0A, 0x01); /* recovery OK */
+                        UART_Log("[FSM] RECOVER → NORMAL  (all sensors safe)\r\n");
+                        DTC_Transmit(0x50, 0x0A, 0x01);
                         g_sysState    = SYS_NORMAL;
                         g_faultActive = 0;
                         g_rpm         = RPM_MIN;
@@ -404,10 +559,11 @@ static void Task_FaultDetect(void *argument)
                     }
                     else
                     {
-                        UART_Log("[FSM] RECOVER → FAULT (still hot)\r\n");
-                        g_sysState    = SYS_FAULT;
-                        g_faultTimer  = now;
-                        g_faultActive = 1;
+                        UART_Log("[FSM] RECOVER → FAULT   (sensors still unsafe)\r\n");
+                        g_sysState     = SYS_FAULT;
+                        g_faultTimer   = now;
+                        g_faultActive  = 1;
+                        g_recoverTimer = now;
                     }
                 }
                 break;
@@ -417,73 +573,42 @@ static void Task_FaultDetect(void *argument)
     }
 }
 
-/* ================================================================
-   TASK 4 — LED Heartbeat (500ms)
-   Green solid  = NORMAL
-   Red solid    = FAULT
-   Orange blink = LIMP
-   Green blink  = RECOVER
-   ================================================================ */
+/* ══════════════════════════════════════════════════════════════════
+   Task_LEDHeartbeat  |  Priority: BelowNormal  |  Period: 500 ms
+   Green  PD12 solid  = NORMAL
+   Red    PD14 solid  = FAULT
+   Orange PD13 blink  = LIMP
+   Green  PD12 blink  = RECOVER
+   ══════════════════════════════════════════════════════════════════ */
 static void Task_LEDHeartbeat(void *argument)
 {
     for (;;)
     {
-        HAL_GPIO_WritePin(GPIOD,
-            GPIO_PIN_12 | GPIO_PIN_13 | GPIO_PIN_14, GPIO_PIN_RESET);
+        HAL_GPIO_WritePin(GPIOD, GPIO_PIN_12 | GPIO_PIN_13 | GPIO_PIN_14, GPIO_PIN_RESET);
 
-        switch (g_sysState) {
-            case SYS_NORMAL:
-                HAL_GPIO_WritePin(GPIOD, GPIO_PIN_12, GPIO_PIN_SET);
-                break;
-            case SYS_FAULT:
-                HAL_GPIO_WritePin(GPIOD, GPIO_PIN_14, GPIO_PIN_SET);
-                break;
-            case SYS_LIMP:
-                HAL_GPIO_TogglePin(GPIOD, GPIO_PIN_13);
-                break;
-            case SYS_RECOVER:
-                HAL_GPIO_TogglePin(GPIOD, GPIO_PIN_12);
-                break;
+        switch (g_sysState)
+        {
+            case SYS_NORMAL:  HAL_GPIO_WritePin(GPIOD, GPIO_PIN_12, GPIO_PIN_SET); break;
+            case SYS_FAULT:   HAL_GPIO_WritePin(GPIOD, GPIO_PIN_14, GPIO_PIN_SET); break;
+            case SYS_LIMP:    HAL_GPIO_TogglePin(GPIOD, GPIO_PIN_13);              break;
+            case SYS_RECOVER: HAL_GPIO_TogglePin(GPIOD, GPIO_PIN_12);              break;
         }
 
         osDelay(500);
     }
 }
 
-/* ================================================================
-   SYSTEM CLOCK — 168MHz from 8MHz HSE
-   ================================================================ */
-void SystemClock_Config(void)
-{
-    RCC_OscInitTypeDef RCC_OscInitStruct = {0};
-    RCC_ClkInitTypeDef RCC_ClkInitStruct = {0};
-
-    __HAL_RCC_PWR_CLK_ENABLE();
-    __HAL_PWR_VOLTAGESCALING_CONFIG(PWR_REGULATOR_VOLTAGE_SCALE1);
-
-    RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSE;
-    RCC_OscInitStruct.HSEState       = RCC_HSE_ON;
-    RCC_OscInitStruct.PLL.PLLState   = RCC_PLL_ON;
-    RCC_OscInitStruct.PLL.PLLSource  = RCC_PLLSOURCE_HSE;
-    RCC_OscInitStruct.PLL.PLLM       = 8;
-    RCC_OscInitStruct.PLL.PLLN       = 336;
-    RCC_OscInitStruct.PLL.PLLP       = RCC_PLLP_DIV2;
-    RCC_OscInitStruct.PLL.PLLQ       = 7;
-    HAL_RCC_OscConfig(&RCC_OscInitStruct);
-
-    RCC_ClkInitStruct.ClockType =
-        RCC_CLOCKTYPE_HCLK | RCC_CLOCKTYPE_SYSCLK |
-        RCC_CLOCKTYPE_PCLK1 | RCC_CLOCKTYPE_PCLK2;
-    RCC_ClkInitStruct.SYSCLKSource   = RCC_SYSCLKSOURCE_PLLCLK;
-    RCC_ClkInitStruct.AHBCLKDivider  = RCC_SYSCLK_DIV1;
-    RCC_ClkInitStruct.APB1CLKDivider = RCC_HCLK_DIV4;
-    RCC_ClkInitStruct.APB2CLKDivider = RCC_HCLK_DIV2;
-    HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_5);
-}
+/* USER CODE END 4 */
 
 void Error_Handler(void)
 {
-    __disable_irq();
-    HAL_GPIO_WritePin(GPIOD, GPIO_PIN_14, GPIO_PIN_SET);
-    while (1) {}
+  /* USER CODE BEGIN Error_Handler_Debug */
+  __disable_irq();
+  HAL_GPIO_WritePin(GPIOD, GPIO_PIN_14, GPIO_PIN_SET);
+  while (1) {}
+  /* USER CODE END Error_Handler_Debug */
 }
+
+#ifdef USE_FULL_ASSERT
+void assert_failed(uint8_t *file, uint32_t line) {}
+#endif

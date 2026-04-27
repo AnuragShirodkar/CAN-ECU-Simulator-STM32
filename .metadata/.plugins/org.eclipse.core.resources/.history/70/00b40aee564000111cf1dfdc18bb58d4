@@ -1,0 +1,535 @@
+/**
+ ******************************************************************************
+ * @file    main.c  —  BOARD 2: Dashboard ECU
+ * @brief   CAN Bus ECU Simulator — Dashboard Node
+ *
+ * Hardware:  STM32F407G-DISC1
+ * Display:   ST7735 1.8" TFT (SPI1 — SCK:PA5, MOSI:PA7, CS:PA4, DC:PA3, RST:PA2)
+ * Actuators: Buzzer (PE0, active high), Relay (PE1, active high)
+ * CAN:       CAN1 via TJA1050 — PD0(RX), PD1(TX) — 500 kbps
+ *            Prescaler=6, BS1=11Tq, BS2=2Tq, APB1=42MHz
+ * No UART:   All output via TFT display + onboard LEDs
+ *
+ * CAN Receive Table (from Engine ECU)
+ * ------------------------------------
+ *  0x100  Engine RPM      2 bytes  0xFFFF = sensor fault
+ *  0x101  Vehicle Speed   1 byte   km/h
+ *  0x102  Engine Temp     2 bytes  value / 10 = °C
+ *  0x103  Relay Command   1 byte   0x01=ON 0x00=OFF
+ *  0x104  System State    1 byte   0=NORMAL 1=FAULT 2=LIMP 3=RECOVER
+ *  0x1FE  Flame Emergency 1 byte   0xFF = emergency
+ *  0x1FF  DTC Code        3 bytes  [sys][hi][lo]
+ *
+ * TFT Layout (128 x 160 px, portrait)
+ * -------------------------------------
+ *  Row 0–17   Title bar (blue)
+ *  Row 18–67  RPM panel (left) | Speed panel (right)
+ *  Row 68–117 Temp panel (left) | State panel (right)
+ *  Row 118–133 DTC strip
+ *  Row 134–159 Status bar (frame counter + bus status)
+ *
+ * FreeRTOS Tasks
+ * ---------------
+ *  Task_TFT_Update       100 ms  Normal         refreshes all live values
+ *  Task_ThresholdCheck    50 ms  AboveNormal    local threshold check + LEDs
+ *  Task_BuzzerHandler     10 ms  Normal         drives buzzer from flag
+ ******************************************************************************
+ */
+
+#include "main.h"
+#include "cmsis_os.h"
+#include "can.h"
+#include "spi.h"
+#include "gpio.h"
+
+/* USER CODE BEGIN Includes */
+#include "st7735.h"
+#include "fonts.h"
+#include <stdio.h>
+#include <string.h>
+/* USER CODE END Includes */
+
+/* ============================================================
+   PRIVATE TYPES & GLOBALS
+   ============================================================ */
+/* USER CODE BEGIN PV */
+
+typedef enum {
+    SYS_NORMAL  = 0,
+    SYS_FAULT   = 1,
+    SYS_LIMP    = 2,
+    SYS_RECOVER = 3
+} SystemState_t;
+
+/* Data received from Engine ECU via CAN RX interrupt */
+volatile uint16_t      rx_rpm       = 0;
+volatile uint8_t       rx_speed     = 0;
+volatile float         rx_temp      = 25.0f;
+volatile uint8_t       rx_relay     = 0;
+volatile SystemState_t rx_sysState  = SYS_NORMAL;
+volatile uint32_t      rx_frameCount = 0;
+
+/* DTC string for display — updated from CAN callback */
+volatile char          dtcStr[12]    = "NONE";
+volatile char          stateStr[10]  = "NORMAL";
+
+/* Buzzer: set from ThresholdCheck or CAN callback, consumed by BuzzerHandler */
+volatile uint8_t buzzerFlag  = 0;
+volatile uint8_t buzzerBeeps = 0;
+
+/* Display dirty flag — set true when values change significantly */
+volatile uint8_t displayDirty = 1;
+
+/* USER CODE END PV */
+
+/* ============================================================
+   PRIVATE FUNCTION PROTOTYPES
+   ============================================================ */
+/* USER CODE BEGIN PFP */
+static void Task_TFT_Update      (void *argument);
+static void Task_ThresholdCheck  (void *argument);
+static void Task_BuzzerHandler   (void *argument);
+static void TFT_DrawStaticFrame  (void);
+static void TFT_UpdateAllValues  (void);
+static void Buzzer_Beep          (uint8_t times);
+/* USER CODE END PFP */
+
+/* ============================================================
+   DISPLAY HELPER FUNCTIONS
+   ============================================================ */
+/* USER CODE BEGIN 0 */
+
+/*
+ * TFT_DrawStaticFrame — draws all static labels and borders once.
+ * Call only on init or after full screen clear.
+ *
+ * Layout:
+ *  [0,0]  128x18   Blue title bar
+ *  [2,20] 60x46    RPM panel
+ *  [66,20] 60x46   Speed panel
+ *  [2,70] 60x46    Temp panel
+ *  [66,70] 60x46   State panel
+ *  [0,118] 128x16  DTC strip
+ *  [0,136] 128x24  Status bar
+ */
+static void TFT_DrawStaticFrame(void)
+{
+    /* Title bar */
+    ST7735_FillRectangle(0, 0, 128, 18, ST7735_BLUE);
+    ST7735_WriteString(8, 5, "ECU DASHBOARD", ST7735_WHITE, ST7735_BLUE);
+
+    /* RPM panel outline + label */
+    ST7735_DrawRectangle(2, 20, 60, 46, ST7735_CYAN);
+    ST7735_WriteString(5, 23, "RPM", ST7735_CYAN, ST7735_BLACK);
+
+    /* Speed panel outline + label */
+    ST7735_DrawRectangle(66, 20, 60, 46, ST7735_GREEN);
+    ST7735_WriteString(69, 23, "SPEED", ST7735_GREEN, ST7735_BLACK);
+
+    /* Temp panel outline + label */
+    ST7735_DrawRectangle(2, 70, 60, 46, ST7735_ORANGE);
+    ST7735_WriteString(5, 73, "TEMP C", ST7735_ORANGE, ST7735_BLACK);
+
+    /* State panel outline + label */
+    ST7735_DrawRectangle(66, 70, 60, 46, ST7735_YELLOW);
+    ST7735_WriteString(69, 73, "STATE", ST7735_YELLOW, ST7735_BLACK);
+
+    /* DTC strip background */
+    ST7735_FillRectangle(0, 118, 128, 16, ST7735_DARKGREY);
+    ST7735_WriteString(3, 121, "DTC:", ST7735_WHITE, ST7735_DARKGREY);
+
+    /* Status bar background */
+    ST7735_FillRectangle(0, 136, 128, 24, ST7735_DARKGREY);
+    ST7735_WriteString(3, 140, "CAN 500kbps", ST7735_WHITE, ST7735_DARKGREY);
+}
+
+/*
+ * TFT_UpdateAllValues — redraws live data cells only.
+ * Clears each cell area before writing to prevent ghost digits.
+ */
+static void TFT_UpdateAllValues(void)
+{
+    char buf[16];
+
+    /* ── RPM cell [4,33] 54x20 ── */
+    ST7735_FillRectangle(4, 33, 54, 20, ST7735_BLACK);
+    if (rx_rpm == 0xFFFF)
+        ST7735_WriteString(4, 35, "FAULT", ST7735_RED, ST7735_BLACK);
+    else {
+        snprintf(buf, sizeof(buf), "%5u", rx_rpm);
+        ST7735_WriteString(4, 35, buf, ST7735_CYAN, ST7735_BLACK);
+    }
+
+    /* ── Speed cell [68,33] 54x20 ── */
+    ST7735_FillRectangle(68, 33, 54, 20, ST7735_BLACK);
+    snprintf(buf, sizeof(buf), "%3u", rx_speed);
+    ST7735_WriteString(68, 35, buf, ST7735_GREEN, ST7735_BLACK);
+    ST7735_WriteString(95, 35, "kmh", ST7735_GREEN, ST7735_BLACK);
+
+    /* ── Temp cell [4,83] 54x20 ── */
+    ST7735_FillRectangle(4, 83, 54, 20, ST7735_BLACK);
+    snprintf(buf, sizeof(buf), "%5.1f", rx_temp);
+    uint16_t tempColor = (rx_temp > 800.0f) ? ST7735_RED :
+                         (rx_temp > 600.0f) ? ST7735_YELLOW : ST7735_ORANGE;
+    ST7735_WriteString(4, 85, buf, tempColor, ST7735_BLACK);
+
+    /* ── State cell [68,83] 54x20 ── */
+    ST7735_FillRectangle(68, 83, 54, 20, ST7735_BLACK);
+    uint16_t stColor;
+    switch (rx_sysState) {
+        case SYS_NORMAL:  stColor = ST7735_GREEN;  break;
+        case SYS_FAULT:   stColor = ST7735_RED;    break;
+        case SYS_LIMP:    stColor = ST7735_YELLOW; break;
+        case SYS_RECOVER: stColor = ST7735_CYAN;   break;
+        default:          stColor = ST7735_WHITE;  break;
+    }
+    ST7735_WriteString(68, 85, (const char *)stateStr, stColor, ST7735_BLACK);
+
+    /* ── DTC strip [30,121] ── */
+    ST7735_FillRectangle(30, 121, 95, 11, ST7735_DARKGREY);
+    uint16_t dtcColor = (strcmp((const char *)dtcStr, "NONE") == 0)
+                        ? ST7735_GREEN : ST7735_RED;
+    ST7735_WriteString(30, 121, (const char *)dtcStr, dtcColor, ST7735_DARKGREY);
+
+    /* ── Frame counter in status bar [68,140] ── */
+    ST7735_FillRectangle(68, 140, 57, 12, ST7735_DARKGREY);
+    snprintf(buf, sizeof(buf), "F:%lu", rx_frameCount);
+    ST7735_WriteString(68, 140, buf, ST7735_WHITE, ST7735_DARKGREY);
+}
+
+static void Buzzer_Beep(uint8_t times)
+{
+    for (uint8_t i = 0; i < times; i++) {
+        HAL_GPIO_WritePin(GPIOE, GPIO_PIN_0, GPIO_PIN_SET);
+        osDelay(200);
+        HAL_GPIO_WritePin(GPIOE, GPIO_PIN_0, GPIO_PIN_RESET);
+        osDelay(150);
+    }
+}
+
+/* USER CODE END 0 */
+
+/* ============================================================
+   MAIN
+   ============================================================ */
+void SystemClock_Config(void);
+
+int main(void)
+{
+    /* USER CODE BEGIN 1 */
+    /* USER CODE END 1 */
+
+    HAL_Init();
+    SystemClock_Config();
+
+    MX_GPIO_Init();
+    MX_CAN1_Init();
+    MX_SPI1_Init();
+
+    /* USER CODE BEGIN 2 */
+
+    /* Buzzer and relay off */
+    HAL_GPIO_WritePin(GPIOE, GPIO_PIN_0, GPIO_PIN_RESET);
+    HAL_GPIO_WritePin(GPIOE, GPIO_PIN_1, GPIO_PIN_RESET);
+
+    /* ── CAN1 filter: pass all frames ── */
+    {
+        CAN_FilterTypeDef flt;
+        flt.FilterBank           = 0;
+        flt.FilterMode           = CAN_FILTERMODE_IDMASK;
+        flt.FilterScale          = CAN_FILTERSCALE_32BIT;
+        flt.FilterIdHigh         = 0x0000;
+        flt.FilterIdLow          = 0x0000;
+        flt.FilterMaskIdHigh     = 0x0000;
+        flt.FilterMaskIdLow      = 0x0000;
+        flt.FilterFIFOAssignment = CAN_RX_FIFO0;
+        flt.FilterActivation     = ENABLE;
+        flt.SlaveStartFilterBank = 14;
+        if (HAL_CAN_ConfigFilter(&hcan1, &flt) != HAL_OK)
+            Error_Handler();
+    }
+
+    if (HAL_CAN_Start(&hcan1) != HAL_OK)
+        Error_Handler();
+
+    if (HAL_CAN_ActivateNotification(&hcan1, CAN_IT_RX_FIFO0_MSG_PENDING) != HAL_OK)
+        Error_Handler();
+
+    /* ── TFT init and static frame ── */
+    ST7735_Init();
+    ST7735_FillScreen(ST7735_BLACK);
+    TFT_DrawStaticFrame();
+
+    /* ── Create tasks ── */
+    osThreadNew(Task_TFT_Update,     NULL,
+        &(const osThreadAttr_t){ .name="TFTTask",
+            .stack_size = 1024 * 4,
+            .priority   = osPriorityNormal });
+
+    osThreadNew(Task_ThresholdCheck, NULL,
+        &(const osThreadAttr_t){ .name="ThreshTask",
+            .stack_size = 512 * 4,
+            .priority   = osPriorityAboveNormal });
+
+    osThreadNew(Task_BuzzerHandler,  NULL,
+        &(const osThreadAttr_t){ .name="BuzzTask",
+            .stack_size = 256 * 4,
+            .priority   = osPriorityNormal });
+
+    osKernelStart();
+
+    /* USER CODE END 2 */
+    while (1) {}
+}
+
+/* ============================================================
+   CAN RX INTERRUPT CALLBACK
+   Keep minimal: store data only, no HAL_Delay, no printf.
+   ============================================================ */
+/* USER CODE BEGIN 4 */
+
+void HAL_CAN_RxFifo0MsgPendingCallback(CAN_HandleTypeDef *hcan)
+{
+    CAN_RxHeaderTypeDef hdr;
+    uint8_t             d[8];
+
+    if (HAL_CAN_GetRxMessage(hcan, CAN_RX_FIFO0, &hdr, d) != HAL_OK)
+        return;
+
+    rx_frameCount++;
+
+    switch (hdr.StdId)
+    {
+        case 0x100: /* RPM */
+            rx_rpm = ((uint16_t)d[0] << 8) | d[1];
+            break;
+
+        case 0x101: /* Speed */
+            rx_speed = d[0];
+            break;
+
+        case 0x102: /* Temperature × 10 */
+        {
+            uint16_t t10 = ((uint16_t)d[0] << 8) | d[1];
+            rx_temp = (float)t10 / 10.0f;
+            break;
+        }
+
+        case 0x103: /* Relay command */
+            rx_relay = d[0];
+            HAL_GPIO_WritePin(GPIOE, GPIO_PIN_1,
+                d[0] ? GPIO_PIN_SET : GPIO_PIN_RESET);
+            break;
+
+        case 0x104: /* System state from Engine ECU */
+            rx_sysState = (SystemState_t)(d[0] & 0x03);
+            switch (rx_sysState) {
+                case SYS_NORMAL:  strncpy((char *)stateStr, "NORMAL",  9); break;
+                case SYS_FAULT:   strncpy((char *)stateStr, "FAULT",   9); break;
+                case SYS_LIMP:    strncpy((char *)stateStr, "LIMP",    9); break;
+                case SYS_RECOVER: strncpy((char *)stateStr, "RECOVER", 9); break;
+            }
+            break;
+
+        case 0x1FE: /* Flame emergency */
+            rx_sysState = SYS_FAULT;
+            strncpy((char *)stateStr, "FLAME!", 9);
+            strncpy((char *)dtcStr,   "P0217",  11);
+            HAL_GPIO_WritePin(GPIOE, GPIO_PIN_1, GPIO_PIN_RESET); /* relay OFF */
+            buzzerBeeps = 5;
+            buzzerFlag  = 1;
+            break;
+
+        case 0x1FF: /* DTC */
+        {
+            uint8_t  sys  = d[0];
+            uint16_t code = ((uint16_t)d[1] << 8) | d[2];
+
+            if      (sys == 0x50 && code == 0x0335)
+                strncpy((char *)dtcStr, "P0335", 11);
+            else if (sys == 0x50 && code == 0x0217)
+                strncpy((char *)dtcStr, "P0217", 11);
+            else if (sys == 0x50 && code == 0x0219)
+                strncpy((char *)dtcStr, "P0219", 11);
+            else if (sys == 0x50 && code == 0x0A01)
+                strncpy((char *)dtcStr, "NONE",  11); /* recovery complete */
+            else {
+                char tmp[12];
+                snprintf(tmp, sizeof(tmp), "%02X%04X", sys, code);
+                strncpy((char *)dtcStr, tmp, 11);
+            }
+            buzzerBeeps = 3;
+            buzzerFlag  = 1;
+            break;
+        }
+
+        default:
+            break;
+    }
+
+    displayDirty = 1;
+}
+
+/* ============================================================
+   TASK IMPLEMENTATIONS
+   ============================================================ */
+
+/*
+ * Task_TFT_Update — 100 ms period, Normal priority
+ * Redraws live value cells on the TFT.
+ */
+static void Task_TFT_Update(void *argument)
+{
+    for (;;)
+    {
+        if (displayDirty)
+        {
+            displayDirty = 0;
+            TFT_UpdateAllValues();
+            HAL_GPIO_TogglePin(GPIOd, GPIO_PIN_12);
+        }
+        osDelay(100);
+    }
+}
+
+/*
+ * Task_ThresholdCheck — 50 ms period, AboveNormal priority
+ * Local threshold validation as backup to Engine ECU state.
+ * Updates LEDs and triggers buzzer on threshold crossings.
+ */
+static void Task_ThresholdCheck(void *argument)
+{
+    SystemState_t prevState = SYS_NORMAL;
+
+    for (;;)
+    {
+        /* ── LED update based on received system state ── */
+        switch (rx_sysState)
+        {
+            case SYS_NORMAL:
+                HAL_GPIO_WritePin(GPIOD, GPIO_PIN_12, GPIO_PIN_SET);
+                HAL_GPIO_WritePin(GPIOD, GPIO_PIN_13, GPIO_PIN_RESET);
+                HAL_GPIO_WritePin(GPIOD, GPIO_PIN_14, GPIO_PIN_RESET);
+                break;
+
+            case SYS_FAULT:
+                HAL_GPIO_WritePin(GPIOD, GPIO_PIN_14, GPIO_PIN_SET);
+                HAL_GPIO_WritePin(GPIOD, GPIO_PIN_12, GPIO_PIN_RESET);
+                HAL_GPIO_WritePin(GPIOD, GPIO_PIN_13, GPIO_PIN_RESET);
+                break;
+
+            case SYS_LIMP:
+                HAL_GPIO_TogglePin(GPIOD, GPIO_PIN_13);
+                HAL_GPIO_WritePin(GPIOD,  GPIO_PIN_12, GPIO_PIN_RESET);
+                HAL_GPIO_WritePin(GPIOD,  GPIO_PIN_14, GPIO_PIN_RESET);
+                break;
+
+            case SYS_RECOVER:
+                HAL_GPIO_TogglePin(GPIOD, GPIO_PIN_12);
+                HAL_GPIO_WritePin(GPIOD,  GPIO_PIN_13, GPIO_PIN_RESET);
+                HAL_GPIO_WritePin(GPIOD,  GPIO_PIN_14, GPIO_PIN_RESET);
+                break;
+        }
+
+        /* ── Local threshold checks (backup to Engine ECU) ── */
+
+        /* RPM overspeed P0219 */
+        if (rx_rpm != 0xFFFF && rx_rpm > 8000U &&
+            rx_sysState == SYS_NORMAL)
+        {
+            strncpy((char *)dtcStr, "P0219", 11);
+            displayDirty = 1;
+            buzzerBeeps  = 1;
+            buzzerFlag   = 1;
+        }
+
+        /* Temperature critical P0217 */
+        if (rx_temp > 800.0f && rx_sysState == SYS_NORMAL)
+        {
+            strncpy((char *)dtcStr, "P0217", 11);
+            HAL_GPIO_WritePin(GPIOE, GPIO_PIN_1, GPIO_PIN_SET); /* relay ON */
+            displayDirty = 1;
+            buzzerBeeps  = 2;
+            buzzerFlag   = 1;
+        }
+
+        /* DTC clear on recovery */
+        if (rx_sysState == SYS_NORMAL &&
+            strcmp((const char *)dtcStr, "NONE") != 0 &&
+            strcmp((const char *)dtcStr, "P0335") != 0)
+        {
+            /* Only clear non-crankshaft DTCs automatically */
+            strncpy((char *)dtcStr, "NONE", 11);
+            HAL_GPIO_WritePin(GPIOE, GPIO_PIN_1, GPIO_PIN_RESET);
+            displayDirty = 1;
+        }
+
+        /* Buzzer on state change */
+        if (rx_sysState != prevState)
+        {
+            prevState    = rx_sysState;
+            displayDirty = 1;
+        }
+
+        osDelay(50);
+    }
+}
+
+/*
+ * Task_BuzzerHandler — 10 ms period, Normal priority
+ * Consumes buzzerFlag and drives the buzzer safely outside ISR context.
+ */
+static void Task_BuzzerHandler(void *argument)
+{
+    for (;;)
+    {
+        if (buzzerFlag)
+        {
+            uint8_t n = buzzerBeeps;
+            buzzerFlag = 0;
+            Buzzer_Beep(n);
+        }
+        osDelay(10);
+    }
+}
+
+/* USER CODE END 4 */
+
+/* ============================================================
+   SYSTEM CLOCK CONFIG — 168 MHz from 8 MHz HSE
+   ============================================================ */
+void SystemClock_Config(void)
+{
+    RCC_OscInitTypeDef osc = {0};
+    RCC_ClkInitTypeDef clk = {0};
+
+    __HAL_RCC_PWR_CLK_ENABLE();
+    __HAL_PWR_VOLTAGESCALING_CONFIG(PWR_REGULATOR_VOLTAGE_SCALE1);
+
+    osc.OscillatorType = RCC_OSCILLATORTYPE_HSE;
+    osc.HSEState       = RCC_HSE_ON;
+    osc.PLL.PLLState   = RCC_PLL_ON;
+    osc.PLL.PLLSource  = RCC_PLLSOURCE_HSE;
+    osc.PLL.PLLM       = 8;
+    osc.PLL.PLLN       = 336;
+    osc.PLL.PLLP       = RCC_PLLP_DIV2;
+    osc.PLL.PLLQ       = 7;
+    if (HAL_RCC_OscConfig(&osc) != HAL_OK) Error_Handler();
+
+    clk.ClockType      = RCC_CLOCKTYPE_HCLK | RCC_CLOCKTYPE_SYSCLK
+                       | RCC_CLOCKTYPE_PCLK1 | RCC_CLOCKTYPE_PCLK2;
+    clk.SYSCLKSource   = RCC_SYSCLKSOURCE_PLLCLK;
+    clk.AHBCLKDivider  = RCC_SYSCLK_DIV1;
+    clk.APB1CLKDivider = RCC_HCLK_DIV4;
+    clk.APB2CLKDivider = RCC_HCLK_DIV2;
+    if (HAL_RCC_ClockConfig(&clk, FLASH_LATENCY_5) != HAL_OK) Error_Handler();
+}
+
+void Error_Handler(void)
+{
+    /* USER CODE BEGIN Error_Handler_Debug */
+    __disable_irq();
+    HAL_GPIO_WritePin(GPIOD, GPIO_PIN_14, GPIO_PIN_SET);
+    while (1) {}
+    /* USER CODE END Error_Handler_Debug */
+}

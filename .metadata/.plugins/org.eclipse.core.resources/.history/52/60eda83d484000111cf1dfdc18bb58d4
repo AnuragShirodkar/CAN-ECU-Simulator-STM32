@@ -1,0 +1,130 @@
+/* ================================================================
+   DASHBOARD ECU — v5.2 PRODUCTION (FIXED)
+   ================================================================ */
+#include "main.h"
+#include "cmsis_os.h"
+#include "can.h"
+#include "spi.h"
+#include "usart.h"
+#include "gpio.h"
+#include <stdio.h>
+#include <string.h>
+
+/* --- UART LOG FIX ---
+   Using huart2 and MX_USART2_UART_Init to match your build errors.
+   ---------------------------------------------------------------- */
+static void UART_Log(const char *msg) {
+    // huart2 is usually the default for the ST-Link Virtual COM Port
+    HAL_UART_Transmit(&huart2, (const uint8_t *)msg, (uint16_t)strlen(msg), 200U);
+}
+
+/* --- FLOAT TO STRING FIX ---
+   Increased fmt buffer to 16 to avoid truncation warning.
+   ---------------------------------------------------------------- */
+static void FloatToStr(float v, char *buf, uint8_t decimals) {
+    int32_t ipart = (int32_t)v;
+    float fpart = v - (float)ipart;
+    uint32_t mult = 1U;
+    if (fpart < 0.0f) fpart = -fpart;
+    for (uint8_t i = 0; i < decimals; i++) mult *= 10U;
+    uint32_t frac = (uint32_t)(fpart * (float)mult + 0.5f);
+    if (frac >= mult) { ipart++; frac = 0U; }
+
+    if (decimals > 0U) {
+        char fmt[16];
+        snprintf(fmt, sizeof(fmt), "%%ld.%%0%dlu", (int)decimals);
+        snprintf(buf, 12, fmt, (long)ipart, (unsigned long)frac);
+    } else {
+        snprintf(buf, 12, "%ld", (long)ipart);
+    }
+}
+
+/* --- TASKS --- */
+
+static void User_Task_Display(void *arg) {
+    (void)arg;
+    for (;;) {
+        Dashboard_Update();
+
+        if (g_buzzerFlag) {
+            uint8_t n = g_buzzerBeeps;
+            g_buzzerFlag = 0U;
+            g_buzzerBeeps = 0U;
+            Buzzer_Beep(n);
+        }
+        osDelay(200);
+    }
+}
+
+static void User_Task_UARTMonitor(void *arg) {
+    (void)arg;
+    static const char *sLabel[] = {"NORMAL","FAULT ","LIMP  ","RECOV "};
+    for (;;) {
+        char tstr[12];
+        FloatToStr(g_canTemp, tstr, 1U);
+
+        char ln[512]; // Increased size to 512 to prevent truncation
+        snprintf(ln, sizeof(ln),
+            "\r\n+--------------------------------------------+\r\n"
+            "|     DASHBOARD ECU — LIVE DATA              |\r\n"
+            "+--------------------------------------------+\r\n"
+            "| RPM   : %5u rpm                         |\r\n"
+            "| Speed : %3u km/h                         |\r\n"
+            "| Temp  : %s C                            |\r\n"
+            "| Mode  : %-6s                           |\r\n"
+            "| Relay : %-14s                   |\r\n"
+            "+--------------------------------------------+\r\n",
+            (unsigned)g_canRPM, (unsigned)g_canSpeed, tstr,
+            sLabel[g_canState & 0x03U], g_canRelay ? "ON (overtemp)" : "OFF");
+        UART_Log(ln);
+
+        if (g_dtcActive) {
+            char dtc[128]; // Increased size to 128
+            snprintf(dtc, sizeof(dtc),
+                "| DTC   : P%02X%02X  [0x%02X 0x%02X 0x%02X]       |\r\n"
+                "+--------------------------------------------+\r\n",
+                (unsigned)g_canDTC[1], (unsigned)g_canDTC[2],
+                (unsigned)g_canDTC[0], (unsigned)g_canDTC[1], (unsigned)g_canDTC[2]);
+            UART_Log(dtc);
+        }
+        osDelay(500);
+    }
+}
+
+/* --- MAIN --- */
+int main(void) {
+    HAL_Init();
+    SystemClock_Config();
+    MX_GPIO_Init();
+    MX_CAN1_Init();
+    MX_SPI1_Init();
+
+    // CHANGED: Use USART2 to match your CubeMX configuration
+    MX_USART2_UART_Init();
+
+    /* CAN Filter & Start */
+    CAN_FilterTypeDef flt = {0};
+    flt.FilterBank = 0;
+    flt.FilterMode = CAN_FILTERMODE_IDMASK;
+    flt.FilterScale = CAN_FILTERSCALE_32BIT;
+    flt.FilterFIFOAssignment = CAN_RX_FIFO0;
+    flt.FilterActivation = ENABLE;
+    HAL_CAN_ConfigFilter(&hcan1, &flt);
+    HAL_CAN_Start(&hcan1);
+    HAL_CAN_ActivateNotification(&hcan1, CAN_IT_RX_FIFO0_MSG_PENDING);
+
+    TFT_Init();
+    Dashboard_Layout();
+
+    osKernelInitialize();
+
+    /* Create tasks using the correct functions */
+    const osThreadAttr_t disp_attr = {.name = "User_Task_Disp", .stack_size = 1024 * 4, .priority = osPriorityNormal};
+    osThreadNew(User_Task_Display, NULL, &disp_attr);
+
+    const osThreadAttr_t uart_attr = {.name = "User_Task_UART", .stack_size = 512 * 4, .priority = osPriorityBelowNormal};
+    osThreadNew(User_Task_UARTMonitor, NULL, &uart_attr);
+
+    osKernelStart();
+    while (1);
+}

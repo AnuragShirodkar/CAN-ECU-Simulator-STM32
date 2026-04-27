@@ -1,0 +1,889 @@
+/* ============================================================
+   DASHBOARD ECU — Board 2 — STM32F407 Discovery
+   CAN Bus ECU Simulator — v4.0 FINAL
+
+   WHAT THIS DOES:
+   ─────────────────────────────────────────────────────────
+   - Receives ALL CAN frames from Engine ECU (Board 1)
+   - Displays on 1.8" ST7735 TFT (128×160):
+       * RPM with large text
+       * Speed (km/h)
+       * Engine Temperature (°C)
+       * System Mode: NORMAL / FAULT / LIMP / RECOVER
+       * DTC code (when fault active)
+   - Mirrors everything to UART (Putty)
+   - Buzzer beeps on fault events received via CAN
+
+   HARDWARE CONNECTIONS (Board 2):
+   ─────────────────────────────────────────────────────────
+   ST7735 TFT (1.8" 128×160):
+     VCC  → 3.3V
+     GND  → GND
+     CS   → PA4  (SPI1 NSS  or GPIO)
+     RESET→ PA3  (GPIO output)
+     DC   → PA2  (GPIO output — Data/Command)
+     SDA  → PA7  (SPI1 MOSI)
+     SCK  → PA5  (SPI1 SCK)
+     LED  → 3.3V (backlight always on) or PA1 (GPIO)
+
+   CAN Bus:
+     TX   → PD1 (CAN1 TX)
+     RX   → PD0 (CAN1 RX)
+     Use MCP2551 or SN65HVD230 transceiver
+     Connect CAN H/L to Engine ECU Board 1
+
+   Buzzer:
+     +    → PE0 (GPIO output)
+     –    → GND
+
+   UART (Putty monitor):
+     TX   → PA2 (USART2 TX — if not using for DC!)
+     NOTE: If PA2 is used for TFT DC, use USART1 on PA9/PA10
+
+   ─────────────────────────────────────────────────────────
+   IMPORTANT: In CubeMX for Board 2:
+   - Enable SPI1 (PA5=SCK, PA7=MOSI) — Transmit Only Master
+   - SPI1 prescaler: divide by 4 = 42MHz/4 = 10.5MHz (ST7735 max 15MHz)
+   - PA2=GPIO_Output (TFT DC)
+   - PA3=GPIO_Output (TFT RESET)
+   - PA4=GPIO_Output (TFT CS)
+   - Enable CAN1 (PD0/PD1)
+   - Enable USART1 PA9/PA10 at 115200 baud
+   - Enable PE0 as GPIO_Output (buzzer)
+
+   CAN FRAME PROTOCOL (received from Engine ECU):
+   ─────────────────────────────────────────────────────────
+   0x100 [2B] RPM         big-endian uint16
+   0x101 [1B] Speed       km/h uint8
+   0x102 [2B] Temp×10     big-endian uint16 (divide by 10 for °C)
+   0x103 [1B] Relay       0x01=overtemp
+   0x104 [1B] SysState    0=NORMAL,1=FAULT,2=LIMP,3=RECOVER
+   0x1FF [3B] DTC         byte0,byte1,byte2
+   ============================================================ */
+
+#include "main.h"
+#include "cmsis_os.h"
+#include "can.h"
+#include "spi.h"
+#include "usart.h"
+#include "gpio.h"
+
+#include <stdio.h>
+#include <string.h>
+#include <stdint.h>
+
+/* ================================================================
+   TFT PIN DEFINITIONS — adjust if your wiring differs
+   ================================================================ */
+#define TFT_CS_PORT    GPIOA
+#define TFT_CS_PIN     GPIO_PIN_4
+
+#define TFT_DC_PORT    GPIOA
+#define TFT_DC_PIN     GPIO_PIN_2
+
+#define TFT_RST_PORT   GPIOA
+#define TFT_RST_PIN    GPIO_PIN_3
+
+/* ── TFT control macros ── */
+#define TFT_CS_LOW()   HAL_GPIO_WritePin(TFT_CS_PORT,  TFT_CS_PIN,  GPIO_PIN_RESET)
+#define TFT_CS_HIGH()  HAL_GPIO_WritePin(TFT_CS_PORT,  TFT_CS_PIN,  GPIO_PIN_SET)
+#define TFT_DC_LOW()   HAL_GPIO_WritePin(TFT_DC_PORT,  TFT_DC_PIN,  GPIO_PIN_RESET)
+#define TFT_DC_HIGH()  HAL_GPIO_WritePin(TFT_DC_PORT,  TFT_DC_PIN,  GPIO_PIN_SET)
+#define TFT_RST_LOW()  HAL_GPIO_WritePin(TFT_RST_PORT, TFT_RST_PIN, GPIO_PIN_RESET)
+#define TFT_RST_HIGH() HAL_GPIO_WritePin(TFT_RST_PORT, TFT_RST_PIN, GPIO_PIN_SET)
+
+/* ================================================================
+   ST7735 COMMANDS
+   ================================================================ */
+#define ST7735_NOP        0x00
+#define ST7735_SWRESET    0x01
+#define ST7735_SLPOUT     0x11
+#define ST7735_NORON      0x13
+#define ST7735_INVOFF     0x20
+#define ST7735_INVON      0x21
+#define ST7735_DISPOFF    0x28
+#define ST7735_DISPON     0x29
+#define ST7735_CASET      0x2A
+#define ST7735_RASET      0x2B
+#define ST7735_RAMWR      0x2C
+#define ST7735_MADCTL     0x36
+#define ST7735_COLMOD     0x3A
+#define ST7735_FRMCTR1    0xB1
+#define ST7735_INVCTR     0xB4
+#define ST7735_PWCTR1     0xC0
+#define ST7735_PWCTR2     0xC1
+#define ST7735_PWCTR3     0xC2
+#define ST7735_VMCTR1     0xC5
+#define ST7735_GMCTRP1    0xE0
+#define ST7735_GMCTRN1    0xE1
+
+/* ================================================================
+   TFT DIMENSIONS
+   ================================================================ */
+#define TFT_WIDTH   128
+#define TFT_HEIGHT  160
+
+/* ================================================================
+   16-BIT COLORS (RGB565)
+   ================================================================ */
+#define COLOR_BLACK    0x0000
+#define COLOR_WHITE    0xFFFF
+#define COLOR_RED      0xF800
+#define COLOR_GREEN    0x07E0
+#define COLOR_BLUE     0x001F
+#define COLOR_YELLOW   0xFFE0
+#define COLOR_ORANGE   0xFD20
+#define COLOR_CYAN     0x07FF
+#define COLOR_MAGENTA  0xF81F
+#define COLOR_GRAY     0x8410
+#define COLOR_DARKGRAY 0x4208
+#define COLOR_DARKGREEN 0x03E0
+
+/* ================================================================
+   RECEIVED CAN DATA — volatile, updated by CAN ISR/task
+   ================================================================ */
+volatile uint16_t  g_canRPM       = 0;
+volatile uint8_t   g_canSpeed     = 0;
+volatile float     g_canTemp      = 0.0f;
+volatile uint8_t   g_canRelay     = 0;
+volatile uint8_t   g_canState     = 0;    /* 0=N,1=F,2=L,3=R */
+volatile uint8_t   g_canDTC[3]    = {0, 0, 0};
+volatile uint8_t   g_dtcActive    = 0;
+volatile uint8_t   g_newData      = 0;    /* flag: new CAN frame received */
+
+/* ================================================================
+   FUNCTION PROTOTYPES
+   ================================================================ */
+/* TFT low-level */
+static void  TFT_Init         (void);
+static void  TFT_SendCmd      (uint8_t cmd);
+static void  TFT_SendData     (uint8_t data);
+//static void  TFT_SendData16   (uint16_t data);
+static void  TFT_SetWindow    (uint8_t x0, uint8_t y0, uint8_t x1, uint8_t y1);
+static void  TFT_FillRect     (uint8_t x, uint8_t y, uint8_t w, uint8_t h, uint16_t color);
+static void  TFT_DrawChar     (uint8_t x, uint8_t y, char c, uint16_t fg, uint16_t bg, uint8_t size);
+static void  TFT_DrawString   (uint8_t x, uint8_t y, const char *str, uint16_t fg, uint16_t bg, uint8_t size);
+static void  TFT_DrawHLine    (uint8_t x, uint8_t y, uint8_t w, uint16_t color);
+static void  TFT_DrawVLine    (uint8_t x, uint8_t y, uint8_t h, uint16_t color);
+//static void  TFT_DrawBorder   (uint8_t x, uint8_t y, uint8_t w, uint8_t h, uint16_t color);
+
+/* Dashboard */
+static void  Dashboard_DrawLayout (void);
+static void  Dashboard_Update     (void);
+
+/* Tasks */
+static void  Task_CANReceive  (void *argument);
+static void  Task_Display     (void *argument);
+static void  Task_UARTMonitor (void *argument);
+
+/* Helpers */
+static void  UART_Log         (const char *msg);
+static void  Buzzer_Beep      (uint8_t times);
+
+/* ================================================================
+   5x7 FONT — minimal ASCII printable (space=0x20 to Z=0x5A + digits)
+   Each char = 5 bytes wide, rendered as 5 columns of 7 pixels
+   ================================================================ */
+static const uint8_t font5x7[][5] = {
+    {0x00,0x00,0x00,0x00,0x00}, /* 0x20 space */
+    {0x00,0x00,0x5F,0x00,0x00}, /* 0x21 ! */
+    {0x00,0x07,0x00,0x07,0x00}, /* 0x22 " */
+    {0x14,0x7F,0x14,0x7F,0x14}, /* 0x23 # */
+    {0x24,0x2A,0x7F,0x2A,0x12}, /* 0x24 $ */
+    {0x23,0x13,0x08,0x64,0x62}, /* 0x25 % */
+    {0x36,0x49,0x55,0x22,0x50}, /* 0x26 & */
+    {0x00,0x05,0x03,0x00,0x00}, /* 0x27 ' */
+    {0x00,0x1C,0x22,0x41,0x00}, /* 0x28 ( */
+    {0x00,0x41,0x22,0x1C,0x00}, /* 0x29 ) */
+    {0x14,0x08,0x3E,0x08,0x14}, /* 0x2A * */
+    {0x08,0x08,0x3E,0x08,0x08}, /* 0x2B + */
+    {0x00,0x50,0x30,0x00,0x00}, /* 0x2C , */
+    {0x08,0x08,0x08,0x08,0x08}, /* 0x2D - */
+    {0x00,0x60,0x60,0x00,0x00}, /* 0x2E . */
+    {0x20,0x10,0x08,0x04,0x02}, /* 0x2F / */
+    {0x3E,0x51,0x49,0x45,0x3E}, /* 0x30 0 */
+    {0x00,0x42,0x7F,0x40,0x00}, /* 0x31 1 */
+    {0x42,0x61,0x51,0x49,0x46}, /* 0x32 2 */
+    {0x21,0x41,0x45,0x4B,0x31}, /* 0x33 3 */
+    {0x18,0x14,0x12,0x7F,0x10}, /* 0x34 4 */
+    {0x27,0x45,0x45,0x45,0x39}, /* 0x35 5 */
+    {0x3C,0x4A,0x49,0x49,0x30}, /* 0x36 6 */
+    {0x01,0x71,0x09,0x05,0x03}, /* 0x37 7 */
+    {0x36,0x49,0x49,0x49,0x36}, /* 0x38 8 */
+    {0x06,0x49,0x49,0x29,0x1E}, /* 0x39 9 */
+    {0x00,0x36,0x36,0x00,0x00}, /* 0x3A : */
+    {0x00,0x56,0x36,0x00,0x00}, /* 0x3B ; */
+    {0x08,0x14,0x22,0x41,0x00}, /* 0x3C < */
+    {0x14,0x14,0x14,0x14,0x14}, /* 0x3D = */
+    {0x00,0x41,0x22,0x14,0x08}, /* 0x3E > */
+    {0x02,0x01,0x51,0x09,0x06}, /* 0x3F ? */
+    {0x32,0x49,0x79,0x41,0x3E}, /* 0x40 @ */
+    {0x7E,0x11,0x11,0x11,0x7E}, /* 0x41 A */
+    {0x7F,0x49,0x49,0x49,0x36}, /* 0x42 B */
+    {0x3E,0x41,0x41,0x41,0x22}, /* 0x43 C */
+    {0x7F,0x41,0x41,0x22,0x1C}, /* 0x44 D */
+    {0x7F,0x49,0x49,0x49,0x41}, /* 0x45 E */
+    {0x7F,0x09,0x09,0x09,0x01}, /* 0x46 F */
+    {0x3E,0x41,0x49,0x49,0x7A}, /* 0x47 G */
+    {0x7F,0x08,0x08,0x08,0x7F}, /* 0x48 H */
+    {0x00,0x41,0x7F,0x41,0x00}, /* 0x49 I */
+    {0x20,0x40,0x41,0x3F,0x01}, /* 0x4A J */
+    {0x7F,0x08,0x14,0x22,0x41}, /* 0x4B K */
+    {0x7F,0x40,0x40,0x40,0x40}, /* 0x4C L */
+    {0x7F,0x02,0x0C,0x02,0x7F}, /* 0x4D M */
+    {0x7F,0x04,0x08,0x10,0x7F}, /* 0x4E N */
+    {0x3E,0x41,0x41,0x41,0x3E}, /* 0x4F O */
+    {0x7F,0x09,0x09,0x09,0x06}, /* 0x50 P */
+    {0x3E,0x41,0x51,0x21,0x5E}, /* 0x51 Q */
+    {0x7F,0x09,0x19,0x29,0x46}, /* 0x52 R */
+    {0x46,0x49,0x49,0x49,0x31}, /* 0x53 S */
+    {0x01,0x01,0x7F,0x01,0x01}, /* 0x54 T */
+    {0x3F,0x40,0x40,0x40,0x3F}, /* 0x55 U */
+    {0x1F,0x20,0x40,0x20,0x1F}, /* 0x56 V */
+    {0x3F,0x40,0x38,0x40,0x3F}, /* 0x57 W */
+    {0x63,0x14,0x08,0x14,0x63}, /* 0x58 X */
+    {0x07,0x08,0x70,0x08,0x07}, /* 0x59 Y */
+    {0x61,0x51,0x49,0x45,0x43}, /* 0x5A Z */
+};
+
+/* ================================================================
+   UART LOG
+   ================================================================ */
+static void UART_Log(const char *msg)
+{
+    /* Using USART1 on Board 2 (PA9 TX, PA10 RX)
+       Change to huart2 if your Board 2 uses USART2 */
+    HAL_UART_Transmit(&huart2, (const uint8_t *)msg,
+                      (uint16_t)strlen(msg), 200);
+}
+
+/* ================================================================
+   BUZZER
+   ================================================================ */
+static void Buzzer_Beep(uint8_t times)
+{
+    for (uint8_t i = 0; i < times; i++) {
+        HAL_GPIO_WritePin(GPIOE, GPIO_PIN_0, GPIO_PIN_SET);
+        osDelay(300);
+        HAL_GPIO_WritePin(GPIOE, GPIO_PIN_0, GPIO_PIN_RESET);
+        osDelay(200);
+    }
+}
+
+/* ================================================================
+   TFT LOW-LEVEL DRIVER — ST7735 via SPI1
+   ================================================================ */
+
+static void TFT_SendCmd(uint8_t cmd)
+{
+    TFT_DC_LOW();
+    TFT_CS_LOW();
+    HAL_SPI_Transmit(&hspi1, &cmd, 1, 10);
+    TFT_CS_HIGH();
+}
+
+static void TFT_SendData(uint8_t data)
+{
+    TFT_DC_HIGH();
+    TFT_CS_LOW();
+    HAL_SPI_Transmit(&hspi1, &data, 1, 10);
+    TFT_CS_HIGH();
+}
+
+//static void TFT_SendData16(uint16_t data)
+//{
+//    uint8_t buf[2];
+//    buf[0] = (data >> 8) & 0xFF;
+//    buf[1] =  data & 0xFF;
+//    TFT_DC_HIGH();
+//    TFT_CS_LOW();
+//    HAL_SPI_Transmit(&hspi1, buf, 2, 10);
+//    TFT_CS_HIGH();
+//}
+
+/* ── ST7735 Full init sequence ── */
+static void TFT_Init(void)
+{
+    /* Hardware reset */
+    TFT_RST_HIGH();
+    HAL_Delay(10);
+    TFT_RST_LOW();
+    HAL_Delay(50);
+    TFT_RST_HIGH();
+    HAL_Delay(150);
+
+    /* Software reset */
+    TFT_SendCmd(ST7735_SWRESET);
+    HAL_Delay(150);
+
+    /* Sleep out */
+    TFT_SendCmd(ST7735_SLPOUT);
+    HAL_Delay(255);
+
+    /* Frame rate control */
+    TFT_SendCmd(ST7735_FRMCTR1);
+    TFT_SendData(0x01); TFT_SendData(0x2C); TFT_SendData(0x2D);
+
+    /* Inversion control */
+    TFT_SendCmd(ST7735_INVCTR);
+    TFT_SendData(0x07);
+
+    /* Power control */
+    TFT_SendCmd(ST7735_PWCTR1);
+    TFT_SendData(0xA2); TFT_SendData(0x02); TFT_SendData(0x84);
+
+    TFT_SendCmd(ST7735_PWCTR2);
+    TFT_SendData(0xC5);
+
+    TFT_SendCmd(ST7735_PWCTR3);
+    TFT_SendData(0x0A); TFT_SendData(0x00);
+
+    /* VCOM */
+    TFT_SendCmd(ST7735_VMCTR1);
+    TFT_SendData(0x0E);
+
+    /* Memory access direction — portrait, RGB order */
+    TFT_SendCmd(ST7735_MADCTL);
+    TFT_SendData(0xC8);  /* MY=1, MX=1, RGB */
+
+    /* 16-bit color */
+    TFT_SendCmd(ST7735_COLMOD);
+    TFT_SendData(0x05);
+
+    /* Gamma positive */
+    TFT_SendCmd(ST7735_GMCTRP1);
+    TFT_SendData(0x02); TFT_SendData(0x1c); TFT_SendData(0x07);
+    TFT_SendData(0x12); TFT_SendData(0x37); TFT_SendData(0x32);
+    TFT_SendData(0x29); TFT_SendData(0x2d); TFT_SendData(0x29);
+    TFT_SendData(0x25); TFT_SendData(0x2B); TFT_SendData(0x39);
+    TFT_SendData(0x00); TFT_SendData(0x01); TFT_SendData(0x03);
+    TFT_SendData(0x10);
+
+    /* Gamma negative */
+    TFT_SendCmd(ST7735_GMCTRN1);
+    TFT_SendData(0x03); TFT_SendData(0x1d); TFT_SendData(0x07);
+    TFT_SendData(0x06); TFT_SendData(0x2E); TFT_SendData(0x2C);
+    TFT_SendData(0x29); TFT_SendData(0x2D); TFT_SendData(0x2E);
+    TFT_SendData(0x2E); TFT_SendData(0x37); TFT_SendData(0x3F);
+    TFT_SendData(0x00); TFT_SendData(0x00); TFT_SendData(0x02);
+    TFT_SendData(0x10);
+
+    /* Normal display on */
+    TFT_SendCmd(ST7735_NORON);
+    HAL_Delay(10);
+
+    /* Display ON */
+    TFT_SendCmd(ST7735_DISPON);
+    HAL_Delay(100);
+
+    /* Clear screen to black */
+    TFT_FillRect(0, 0, TFT_WIDTH, TFT_HEIGHT, COLOR_BLACK);
+}
+
+/* ── Set pixel window for drawing ── */
+static void TFT_SetWindow(uint8_t x0, uint8_t y0, uint8_t x1, uint8_t y1)
+{
+    TFT_SendCmd(ST7735_CASET);
+    TFT_SendData(0x00); TFT_SendData(x0);
+    TFT_SendData(0x00); TFT_SendData(x1);
+
+    TFT_SendCmd(ST7735_RASET);
+    TFT_SendData(0x00); TFT_SendData(y0);
+    TFT_SendData(0x00); TFT_SendData(y1);
+
+    TFT_SendCmd(ST7735_RAMWR);
+}
+
+/* ── Fill rectangle with solid color ── */
+static void TFT_FillRect(uint8_t x, uint8_t y, uint8_t w, uint8_t h, uint16_t color)
+{
+    if (x >= TFT_WIDTH || y >= TFT_HEIGHT) return;
+    if (x + w > TFT_WIDTH)  w = TFT_WIDTH  - x;
+    if (y + h > TFT_HEIGHT) h = TFT_HEIGHT - y;
+
+    TFT_SetWindow(x, y, x + w - 1, y + h - 1);
+
+    uint8_t hi = (color >> 8) & 0xFF;
+    uint8_t lo =  color & 0xFF;
+
+    TFT_DC_HIGH();
+    TFT_CS_LOW();
+    for (uint32_t i = 0; i < (uint32_t)w * h; i++) {
+        HAL_SPI_Transmit(&hspi1, &hi, 1, 5);
+        HAL_SPI_Transmit(&hspi1, &lo, 1, 5);
+    }
+    TFT_CS_HIGH();
+}
+
+/* ── Draw horizontal line ── */
+static void TFT_DrawHLine(uint8_t x, uint8_t y, uint8_t w, uint16_t color)
+{
+    TFT_FillRect(x, y, w, 1, color);
+}
+
+/* ── Draw vertical line ── */
+static void TFT_DrawVLine(uint8_t x, uint8_t y, uint8_t h, uint16_t color)
+{
+    TFT_FillRect(x, y, 1, h, color);
+}
+
+/* ── Draw rectangle border ── */
+//static void TFT_DrawBorder(uint8_t x, uint8_t y, uint8_t w, uint8_t h, uint16_t color)
+//{
+//    TFT_DrawHLine(x,         y,         w,     color); /* top */
+//    TFT_DrawHLine(x,         y + h - 1, w,     color); /* bottom */
+//    TFT_DrawVLine(x,         y,         h,     color); /* left */
+//    TFT_DrawVLine(x + w - 1, y,         h,     color); /* right */
+//}
+
+/* ── Draw single character using 5x7 font ── */
+/* size=1: 5×7 pixels. size=2: 10×14 pixels, etc. */
+static void TFT_DrawChar(uint8_t x, uint8_t y, char c,
+                          uint16_t fg, uint16_t bg, uint8_t size)
+{
+    if (c < 0x20 || c > 0x5A) c = '?';
+    const uint8_t *glyph = font5x7[(uint8_t)(c - 0x20)];
+
+    for (uint8_t col = 0; col < 5; col++) {
+        uint8_t colData = glyph[col];
+        for (uint8_t row = 0; row < 7; row++) {
+            uint16_t color = (colData & (1 << row)) ? fg : bg;
+            TFT_FillRect(x + col * size,
+                         y + row * size,
+                         size, size, color);
+        }
+    }
+    /* 1 pixel gap column after char */
+    TFT_FillRect(x + 5 * size, y, size, 7 * size, bg);
+}
+
+/* ── Draw null-terminated string ── */
+static void TFT_DrawString(uint8_t x, uint8_t y, const char *str,
+                            uint16_t fg, uint16_t bg, uint8_t size)
+{
+    uint8_t cx = x;
+    while (*str) {
+        if (cx + 6 * size > TFT_WIDTH) break;  /* clip at screen edge */
+        TFT_DrawChar(cx, y, *str, fg, bg, size);
+        cx += (uint8_t)(6 * size);
+        str++;
+    }
+}
+
+/* ================================================================
+   DASHBOARD LAYOUT
+   ─────────────────────────────────────────────────────────
+   Y=0..14    Header bar (ECU title)
+   Y=15       Separator
+   Y=16..39   RPM value (large, size=2)
+   Y=40       Separator
+   Y=41..54   Speed
+   Y=55       Separator
+   Y=56..69   Temperature
+   Y=70       Separator
+   Y=71..84   Mode
+   Y=85       Separator
+   Y=86..99   DTC area
+   Y=100      Separator
+   Y=101..115 Status bar
+   ================================================================ */
+
+static void Dashboard_DrawLayout(void)
+{
+    /* Background */
+    TFT_FillRect(0, 0, TFT_WIDTH, TFT_HEIGHT, COLOR_BLACK);
+
+    /* Header bar */
+    TFT_FillRect(0, 0, TFT_WIDTH, 15, COLOR_DARKGREEN);
+    TFT_DrawString(4, 4, "CAN BUS DASHBOARD", COLOR_WHITE, COLOR_DARKGREEN, 1);
+
+    /* Separators */
+    uint8_t seps[] = {15, 40, 55, 70, 85, 100};
+    for (uint8_t i = 0; i < 6; i++)
+        TFT_DrawHLine(0, seps[i], TFT_WIDTH, COLOR_GRAY);
+
+    /* Labels (small, size=1) */
+    TFT_DrawString(2, 17, "RPM:", COLOR_CYAN,   COLOR_BLACK, 1);
+    TFT_DrawString(2, 42, "SPD:", COLOR_YELLOW, COLOR_BLACK, 1);
+    TFT_DrawString(2, 57, "TMP:", COLOR_ORANGE, COLOR_BLACK, 1);
+    TFT_DrawString(2, 72, "MOD:", COLOR_WHITE,  COLOR_BLACK, 1);
+    TFT_DrawString(2, 87, "DTC:", COLOR_RED,    COLOR_BLACK, 1);
+    TFT_DrawString(2, 102,"ECU:", COLOR_GRAY,   COLOR_BLACK, 1);
+}
+
+/* ── Update all data fields on TFT ── */
+static void Dashboard_Update(void)
+{
+    char buf[24];
+
+    /* ── RPM (size=2 for visibility) ── */
+    /* Clear value area */
+    TFT_FillRect(36, 17, 90, 14, COLOR_BLACK);
+    snprintf(buf, sizeof(buf), "%5u", (unsigned)g_canRPM);
+    uint16_t rpmColor = (g_canState == 1) ? COLOR_RED :
+                        (g_canState == 2) ? COLOR_ORANGE : COLOR_GREEN;
+    TFT_DrawString(36, 17, buf, rpmColor, COLOR_BLACK, 1);
+    TFT_DrawString(78, 17, "rpm", COLOR_GRAY, COLOR_BLACK, 1);
+
+    /* ── Speed ── */
+    TFT_FillRect(36, 42, 90, 12, COLOR_BLACK);
+    snprintf(buf, sizeof(buf), "%3u km/h", (unsigned)g_canSpeed);
+    TFT_DrawString(36, 42, buf, COLOR_YELLOW, COLOR_BLACK, 1);
+
+    /* ── Temperature ── */
+    TFT_FillRect(36, 57, 90, 12, COLOR_BLACK);
+    int16_t tw = (int16_t)g_canTemp;
+    uint8_t tf = (uint8_t)((g_canTemp - (float)tw) * 10.0f);
+    uint16_t tempColor = (g_canTemp > 40.0f) ? COLOR_RED :
+                         (g_canTemp > 35.0f) ? COLOR_ORANGE : COLOR_GREEN;
+    snprintf(buf, sizeof(buf), "%3d.%u C", tw, tf);
+    TFT_DrawString(36, 57, buf, tempColor, COLOR_BLACK, 1);
+
+    /* ── Mode ── */
+    TFT_FillRect(36, 72, 90, 12, COLOR_BLACK);
+    const char *modeStr;
+    uint16_t modeColor;
+    switch (g_canState & 0x03) {
+        case 0:  modeStr = "NORMAL";  modeColor = COLOR_GREEN;  break;
+        case 1:  modeStr = "FAULT!";  modeColor = COLOR_RED;    break;
+        case 2:  modeStr = "LIMP  ";  modeColor = COLOR_ORANGE; break;
+        case 3:  modeStr = "RECOV ";  modeColor = COLOR_CYAN;   break;
+        default: modeStr = "------";  modeColor = COLOR_GRAY;   break;
+    }
+    /* Mode background highlight in fault */
+    if (g_canState == 1)
+        TFT_FillRect(36, 72, 90, 12, COLOR_RED);
+    TFT_DrawString(36, 72, modeStr, modeColor,
+                   (g_canState == 1) ? COLOR_RED : COLOR_BLACK, 1);
+
+    /* ── DTC ── */
+    TFT_FillRect(36, 87, 90, 12, COLOR_BLACK);
+    if (g_dtcActive && (g_canDTC[0] || g_canDTC[1] || g_canDTC[2])) {
+        snprintf(buf, sizeof(buf), "P%02X%02X", g_canDTC[1], g_canDTC[2]);
+        TFT_DrawString(36, 87, buf, COLOR_RED, COLOR_BLACK, 1);
+    } else {
+        TFT_DrawString(36, 87, "NONE", COLOR_GRAY, COLOR_BLACK, 1);
+    }
+
+    /* ── Status bar ── */
+    TFT_FillRect(36, 102, 90, 12, COLOR_BLACK);
+    snprintf(buf, sizeof(buf), "%lu ms", (unsigned long)HAL_GetTick());
+    TFT_DrawString(36, 102, buf, COLOR_DARKGRAY, COLOR_BLACK, 1);
+}
+
+/* ================================================================
+   MAIN
+   ================================================================ */
+int main(void)
+{
+    HAL_Init();
+    SystemClock_Config();
+    MX_GPIO_Init();
+    MX_CAN1_Init();
+    MX_SPI1_Init();
+    MX_USART2_UART_Init();
+
+    /* Buzzer OFF */
+    HAL_GPIO_WritePin(GPIOE, GPIO_PIN_0, GPIO_PIN_RESET);
+
+    /* TFT pins initial state */
+    TFT_CS_HIGH();
+    TFT_RST_HIGH();
+    TFT_DC_HIGH();
+    g_buzzerBeeps = 2;
+    /* ── CAN1 filter: accept all ── */
+    {
+        CAN_FilterTypeDef flt = {0};
+        flt.FilterBank           = 0;
+        flt.FilterMode           = CAN_FILTERMODE_IDMASK;
+        flt.FilterScale          = CAN_FILTERSCALE_32BIT;
+        flt.FilterIdHigh         = 0x0000;
+        flt.FilterIdLow          = 0x0000;
+        flt.FilterMaskIdHigh     = 0x0000;
+        flt.FilterMaskIdLow      = 0x0000;
+        flt.FilterFIFOAssignment = CAN_RX_FIFO0;
+        flt.FilterActivation     = ENABLE;
+        flt.SlaveStartFilterBank = 14;
+        HAL_CAN_ConfigFilter(&hcan1, &flt);
+    }
+    HAL_CAN_Start(&hcan1);
+
+    /* Boot banner to UART */
+    UART_Log("\r\n================================================\r\n");
+    UART_Log("  DASHBOARD ECU  |  STM32F407  |  v4.0 FINAL  \r\n");
+    UART_Log("  CAN RX: 0x100 RPM | 0x101 SPD | 0x102 TEMP  \r\n");
+    UART_Log("  CAN RX: 0x104 STATE | 0x1FF DTC              \r\n");
+    UART_Log("  TFT: ST7735 128x160 via SPI1                  \r\n");
+    UART_Log("================================================\r\n\r\n");
+
+    /* Init TFT */
+    UART_Log("[INIT] TFT init...\r\n");
+    TFT_Init();
+    UART_Log("[INIT] TFT ready\r\n");
+
+    /* Draw static layout */
+    Dashboard_DrawLayout();
+
+    /* Show waiting message */
+    TFT_DrawString(10, 120, "WAITING FOR CAN...", COLOR_YELLOW, COLOR_BLACK, 1);
+
+    /* Startup beep */
+    HAL_GPIO_WritePin(GPIOE, GPIO_PIN_0, GPIO_PIN_SET);
+    HAL_Delay(200);
+    HAL_GPIO_WritePin(GPIOE, GPIO_PIN_0, GPIO_PIN_RESET);
+
+    UART_Log("[INIT] Starting FreeRTOS...\r\n\r\n");
+
+    /* ── Create tasks ── */
+    osThreadNew(Task_CANReceive, NULL,
+        &(const osThreadAttr_t){
+            .name       = "CANRx",
+            .stack_size = 512 * 4,
+            .priority   = osPriorityAboveNormal });
+
+    osThreadNew(Task_Display, NULL,
+        &(const osThreadAttr_t){
+            .name       = "Display",
+            .stack_size = 1024 * 4,
+            .priority   = osPriorityNormal });
+
+    osThreadNew(Task_UARTMonitor, NULL,
+        &(const osThreadAttr_t){
+            .name       = "UART",
+            .stack_size = 512 * 4,
+            .priority   = osPriorityBelowNormal });
+
+    osKernelInitialize();
+    MX_FREERTOS_Init();
+    osKernelStart();
+
+    while (1) {}
+}
+
+/* ================================================================
+   TASK 1 — CANReceive  |  Priority: AboveNormal  |  Period: 5ms
+   ─────────────────────────────────────────────────────────────
+   Polls CAN FIFO0 for incoming frames
+   Decodes all known IDs from Engine ECU
+   ================================================================ */
+static void Task_CANReceive(void *argument)
+{
+
+    CAN_RxHeaderTypeDef rxHeader;
+    uint8_t rxData[8];
+    static uint8_t prevState = 0xFF;
+
+    for (;;)
+    {
+        /* Check if a frame is waiting in FIFO0 */
+        if (HAL_CAN_GetRxFifoFillLevel(&hcan1, CAN_RX_FIFO0) > 0)
+        {
+            if (HAL_CAN_GetRxMessage(&hcan1, CAN_RX_FIFO0, &rxHeader, rxData) == HAL_OK)
+            {
+                switch (rxHeader.StdId)
+                {
+                    /* ── 0x100: RPM (2 bytes big-endian) ── */
+                    case 0x100:
+                        if (rxHeader.DLC >= 2) {
+                            g_canRPM = ((uint16_t)rxData[0] << 8) | rxData[1];
+                        }
+                        g_newData = 1;
+                        break;
+
+                    /* ── 0x101: Speed (1 byte km/h) ── */
+                    case 0x101:
+                        if (rxHeader.DLC >= 1) {
+                            g_canSpeed = rxData[0];
+                        }
+                        break;
+
+                    /* ── 0x102: Temperature × 10 (2 bytes big-endian) ── */
+                    case 0x102:
+                        if (rxHeader.DLC >= 2) {
+                            uint16_t raw10 = ((uint16_t)rxData[0] << 8) | rxData[1];
+                            g_canTemp = (float)raw10 / 10.0f;
+                        }
+                        break;
+
+                    /* ── 0x103: Relay ── */
+                    case 0x103:
+                        if (rxHeader.DLC >= 1) {
+                            g_canRelay = rxData[0];
+                        }
+                        break;
+
+                    /* ── 0x104: System State ── */
+                    case 0x104:
+                        if (rxHeader.DLC >= 1) {
+                            uint8_t newState = rxData[0] & 0x03;
+                            if (newState != prevState) {
+                                /* State changed — beep if entering fault/limp */
+                                if (newState == 1) {        /* FAULT */
+                                   // g_buzzerBeeps = 2;
+                                    /* Will beep in UART task context */
+                                } else if (newState == 2) { /* LIMP */
+                                    g_buzzerBeeps = 1;
+                                }
+                                prevState = newState;
+                            }
+                            g_canState = newState;
+                        }
+                        break;
+
+                    /* ── 0x1FF: DTC (3 bytes) ── */
+                    case 0x1FF:
+                        if (rxHeader.DLC >= 3) {
+                            g_canDTC[0] = rxData[0];
+                            g_canDTC[1] = rxData[1];
+                            g_canDTC[2] = rxData[2];
+                            /* Recovery clear code: 0x50 0x0A 0x01 */
+                            g_dtcActive = !((rxData[0] == 0x50) &&
+                                           (rxData[1] == 0x0A) &&
+                                           (rxData[2] == 0x01));
+                        }
+                        break;
+
+                    default:
+                        break;
+                }
+            }
+        }
+
+        osDelay(5);  /* Poll at 200Hz */
+    }
+}
+
+/* Shared buzzer vars for Dashboard tasks */
+volatile uint8_t g_buzzerBeeps = 0;
+volatile uint8_t g_buzzerFlag  = 0;
+
+/* ================================================================
+   TASK 2 — Display  |  Priority: Normal  |  Period: 200ms
+   ─────────────────────────────────────────────────────────────
+   Refreshes TFT dashboard at 5Hz
+   Only redraws data fields, not static layout
+   ================================================================ */
+static void Task_Display(void *argument)
+{
+    /* Small delay to let layout render first */
+    osDelay(500);
+
+    /* Remove "waiting" message */
+    TFT_FillRect(0, 116, TFT_WIDTH, 12, COLOR_BLACK);
+
+    for (;;)
+    {
+        Dashboard_Update();
+
+        /* Beep on fault transitions (triggered by CAN task) */
+        if (g_buzzerBeeps > 0) {
+            uint8_t n = g_buzzerBeeps;
+            g_buzzerBeeps = 0;
+            Buzzer_Beep(n);
+        }
+
+        osDelay(200);  /* 5Hz refresh — fast enough, not flickering */
+    }
+}
+
+/* ================================================================
+   TASK 3 — UARTMonitor  |  Priority: BelowNormal  |  Period: 500ms
+   ─────────────────────────────────────────────────────────────
+   Mirrors dashboard data to Putty terminal
+   Same information as TFT
+   ================================================================ */
+static const char *stateLabels[] = {"NORMAL", "FAULT ", "LIMP  ", "RECOV "};
+
+static void Task_UARTMonitor(void *argument)
+{
+    osDelay(1000);  /* Let CAN receive some frames first */
+
+    for (;;)
+    {
+        /* Integer temp for safe snprintf */
+        int16_t tw = (int16_t)g_canTemp;
+        uint8_t tf = (uint8_t)((g_canTemp - (float)tw) * 10.0f);
+
+        char line[220];
+        snprintf(line, sizeof(line),
+            "\r\n+---------------------------------------------+\r\n"
+            "|        DASHBOARD ECU — LIVE DATA            |\r\n"
+            "+---------------------------------------------+\r\n"
+            "| RPM   : %5u rpm                          |\r\n"
+            "| Speed : %3u km/h                          |\r\n"
+            "| Temp  : %3d.%u C                           |\r\n"
+            "| Mode  : %-6s                            |\r\n"
+            "| Relay : %s                            |\r\n"
+            "+---------------------------------------------+\r\n",
+            (unsigned)g_canRPM,
+            (unsigned)g_canSpeed,
+            tw, tf,
+            stateLabels[g_canState & 0x03],
+            g_canRelay ? "ON  (overtemp)" : "OFF           ");
+        UART_Log(line);
+
+        /* DTC info */
+        if (g_dtcActive) {
+            char dtc[80];
+            snprintf(dtc, sizeof(dtc),
+                "| DTC   : P%02X%02X  [0x%02X 0x%02X 0x%02X]        |\r\n"
+                "+---------------------------------------------+\r\n",
+                g_canDTC[1], g_canDTC[2],
+                g_canDTC[0], g_canDTC[1], g_canDTC[2]);
+            UART_Log(dtc);
+        } else {
+            UART_Log("| DTC   : NONE                                |\r\n"
+                     "+---------------------------------------------+\r\n");
+        }
+
+        osDelay(500);
+    }
+}
+
+/* ================================================================
+   SYSTEM CLOCK — 168 MHz from 8 MHz HSE
+   ================================================================ */
+void SystemClock_Config(void)
+{
+    RCC_OscInitTypeDef RCC_OscInitStruct = {0};
+    RCC_ClkInitTypeDef RCC_ClkInitStruct = {0};
+
+    __HAL_RCC_PWR_CLK_ENABLE();
+    __HAL_PWR_VOLTAGESCALING_CONFIG(PWR_REGULATOR_VOLTAGE_SCALE1);
+
+    RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSE;
+    RCC_OscInitStruct.HSEState       = RCC_HSE_ON;
+    RCC_OscInitStruct.PLL.PLLState   = RCC_PLL_ON;
+    RCC_OscInitStruct.PLL.PLLSource  = RCC_PLLSOURCE_HSE;
+    RCC_OscInitStruct.PLL.PLLM       = 8;
+    RCC_OscInitStruct.PLL.PLLN       = 336;
+    RCC_OscInitStruct.PLL.PLLP       = RCC_PLLP_DIV2;
+    RCC_OscInitStruct.PLL.PLLQ       = 7;
+    HAL_RCC_OscConfig(&RCC_OscInitStruct);
+
+    RCC_ClkInitStruct.ClockType =
+        RCC_CLOCKTYPE_HCLK | RCC_CLOCKTYPE_SYSCLK |
+        RCC_CLOCKTYPE_PCLK1 | RCC_CLOCKTYPE_PCLK2;
+    RCC_ClkInitStruct.SYSCLKSource   = RCC_SYSCLKSOURCE_PLLCLK;
+    RCC_ClkInitStruct.AHBCLKDivider  = RCC_SYSCLK_DIV1;
+    RCC_ClkInitStruct.APB1CLKDivider = RCC_HCLK_DIV4;
+    RCC_ClkInitStruct.APB2CLKDivider = RCC_HCLK_DIV2;
+    HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_5);
+}
+
+/* ================================================================
+   ERROR HANDLER
+   ================================================================ */
+void Error_Handler(void)
+{
+    __disable_irq();
+    HAL_GPIO_WritePin(GPIOD, GPIO_PIN_14, GPIO_PIN_SET);
+    while (1) {}
+}
+
+#ifdef USE_FULL_ASSERT
+void assert_failed(uint8_t *file, uint32_t line)
+{
+    (void)file; (void)line;
+}
+#endif
